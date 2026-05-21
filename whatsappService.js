@@ -24,14 +24,19 @@ async function sendWhatsAppMessage(to, text) {
     },
   };
 
-  const response = await axios.post(url, payload, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-  });
+  try {
+    const response = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    });
 
-  return response.data;
+    return response.data;
+  } catch (error) {
+    console.error("Erro ao enviar WhatsApp:", error.response?.data || error.message);
+    throw error;
+  }
 }
 
 module.exports = { sendWhatsAppMessage };

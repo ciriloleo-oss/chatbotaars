@@ -6,13 +6,13 @@ const { createTicket } = require("./ticketService");
 const { sendWhatsAppMessage } = require("./whatsappService");
 
 const app = express();
+
 app.use(express.json());
 
 app.get("/", (req, res) => {
-  res.send("Bot do condomínio online");
+  res.status(200).send("Bot do condomínio online");
 });
 
-// Verificação do webhook da Meta / WhatsApp
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -26,7 +26,6 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// Recebimento das mensagens do WhatsApp
 app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
@@ -43,6 +42,7 @@ app.post("/webhook", async (req, res) => {
         message.from,
         "Recebi sua mensagem. No momento, consigo interpretar melhor mensagens de texto. Por favor, descreva sua solicitação em poucas palavras."
       );
+
       return res.sendStatus(200);
     }
 

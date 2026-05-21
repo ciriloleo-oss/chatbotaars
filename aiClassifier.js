@@ -1,7 +1,7 @@
 const OpenAI = require("openai");
 
 if (!process.env.OPENAI_API_KEY) {
-  throw new Error("OPENAI_API_KEY não configurada no .env");
+  throw new Error("OPENAI_API_KEY não configurada");
 }
 
 const client = new OpenAI({
@@ -107,17 +107,16 @@ Retorne SOMENTE JSON válido neste formato, sem markdown:
 }
 `;
 
-  const response = await client.responses.create({
-    model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-    input: prompt,
-  });
-
-  const output = response.output_text;
-
   try {
+    const response = await client.responses.create({
+      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+      input: prompt,
+    });
+
+    const output = response.output_text;
     return JSON.parse(output);
   } catch (error) {
-    console.error("Erro ao converter JSON da IA:", output);
+    console.error("Erro OpenAI/classificação:", error.message);
 
     return {
       category: "Outros",
@@ -126,11 +125,11 @@ Retorne SOMENTE JSON válido neste formato, sem markdown:
       requires_manager: false,
       requires_human: true,
       emergency: false,
-      sentiment: "Não identificado",
+      sentiment: "Indefinido",
       summary: message,
       missing_information: ["Nome do morador", "Unidade"],
       suggested_reply:
-        "Entendi. Vou registrar sua solicitação para análise da equipe. Por favor, informe seu nome e unidade.",
+        "Sua solicitação foi recebida e será analisada pela equipe responsável. Para agilizar, informe seu nome e unidade.",
     };
   }
 }
