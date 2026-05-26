@@ -25,18 +25,19 @@ async function sendWhatsAppMessage(to, text) {
   };
 
   try {
-    const response = await axios.post(url, payload, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-    });
+  console.log("Enviando WhatsApp para:", to);
 
-    return response.data;
-  } catch (error) {
-    console.error("Erro ao enviar WhatsApp:", error.response?.data || error.message);
-    throw error;
-  }
+  const response = await axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  console.log("Resposta WhatsApp enviada:", response.data);
+
+  return response.data;
+} catch (error) {
+  console.error("Erro ao enviar WhatsApp:", error.response?.data || error.message);
+  throw error;
 }
-
-module.exports = { sendWhatsAppMessage };
