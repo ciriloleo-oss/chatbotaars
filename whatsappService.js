@@ -9,7 +9,8 @@ async function sendWhatsAppMessage(to, text) {
       to,
       text,
     });
-    return;
+
+    return null;
   }
 
   const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;

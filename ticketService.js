@@ -3,19 +3,16 @@ const { supabase } = require("./supabase");
 function generateProtocol() {
   const year = new Date().getFullYear();
   const random = Math.floor(10000 + Math.random() * 90000);
+
   return `RS-${year}-${random}`;
 }
 
 async function findOrCreateResident(phone) {
-  const { data: existing, error: selectError } = await supabase
+  const { data: existing } = await supabase
     .from("residents")
     .select("*")
     .eq("phone", phone)
     .maybeSingle();
-
-  if (selectError) {
-    throw selectError;
-  }
 
   if (existing) {
     return existing;
@@ -37,8 +34,14 @@ async function findOrCreateResident(phone) {
   return data;
 }
 
-async function createTicket({ phone, message, classification }) {
+async function createTicket({
+  phone,
+  message,
+  classification,
+  whatsappMessageId,
+}) {
   const resident = await findOrCreateResident(phone);
+
   const protocol = generateProtocol();
 
   const { data: ticket, error } = await supabase
@@ -46,18 +49,11 @@ async function createTicket({ phone, message, classification }) {
     .insert({
       protocol,
       resident_id: resident.id,
-      category: classification.category || "Outros",
-      priority: classification.priority || "Média",
+      category: classification.category,
+      priority: classification.priority,
       description: message,
-      summary: classification.summary || message,
-      sentiment: classification.sentiment || null,
-      emergency: classification.emergency || false,
-      requires_manager: classification.requires_manager || false,
-      requires_human:
-        classification.requires_human === undefined
-          ? true
-          : classification.requires_human,
-      assigned_to: classification.responsible || ["Recepção"],
+      summary: classification.summary,
+      emergency: classification.emergency,
       status: "Novo",
       source: "whatsapp",
     })
@@ -73,14 +69,7 @@ async function createTicket({ phone, message, classification }) {
     sender: "resident",
     message,
     message_type: "text",
-  });
-
-  await supabase.from("ticket_status_history").insert({
-    ticket_id: ticket.id,
-    old_status: null,
-    new_status: "Novo",
-    changed_by: "chatbot",
-    note: "Chamado criado automaticamente pelo WhatsApp.",
+    attachment_url: whatsappMessageId,
   });
 
   return ticket;
@@ -88,6 +77,4 @@ async function createTicket({ phone, message, classification }) {
 
 module.exports = {
   createTicket,
-  findOrCreateResident,
-  generateProtocol,
 };
