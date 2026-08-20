@@ -22,6 +22,7 @@ const {
 const { answerFromOfficialDocuments } = require("./knowledgeService");
 const { enforceNewConversationIntent, resolveTicketType } = require("./interactionPolicy");
 const { sendWhatsAppMessage } = require("./whatsappService");
+const { listTicketsForAdmin, getTicketDetailForAdmin } = require("./adminService");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -65,6 +66,8 @@ if (!process.env.WEB_CHAT_SIGNING_SECRET) {
   console.warn("WEB_CHAT_SIGNING_SECRET não configurado. Configure no Railway.");
 }
 
+const adminSigningSecret = process.env.ADMIN_SESSION_SECRET || signingSecret;
+
 function base64url(value) {
   return Buffer.from(value).toString("base64url");
 }
@@ -104,6 +107,55 @@ function verifySession(token) {
     return null;
   }
 }
+
+function signAdminSession() {
+  const payload = {
+    scope: "admin",
+    exp: Date.now() + 8 * 60 * 60 * 1000,
+  };
+  const encoded = base64url(JSON.stringify(payload));
+  const signature = crypto
+    .createHmac("sha256", adminSigningSecret)
+    .update(encoded)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyAdminSession(token) {
+  if (!token || typeof token !== "string" || !token.includes(".")) return null;
+  try {
+    const [encoded, signature] = token.split(".");
+    const expected = crypto
+      .createHmac("sha256", adminSigningSecret)
+      .update(encoded)
+      .digest("base64url");
+    const a = Buffer.from(signature);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    if (payload.scope !== "admin" || !payload.exp || payload.exp < Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function requireAdmin(req, res, next) {
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!verifyAdminSession(token)) {
+    return res.status(401).json({ error: "Sessão administrativa inválida ou expirada." });
+  }
+  return next();
+}
+
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas tentativas de acesso. Aguarde alguns minutos." },
+});
 
 function sanitizeResident(input = {}) {
   const digits = String(input.phone || "").replace(/\D/g, "");
@@ -152,6 +204,63 @@ app.get("/api/health", (req, res) => {
     knowledgeConfigured: Boolean(process.env.OPENAI_VECTOR_STORE_ID),
     timestamp: new Date().toISOString(),
   });
+});
+
+// ----------------------
+// ÁREA ADMINISTRATIVA - SOMENTE LEITURA
+// ----------------------
+
+app.post("/api/admin/login", adminLoginLimiter, (req, res) => {
+  const configuredPassword = String(process.env.ADMIN_DASHBOARD_PASSWORD || "");
+  const suppliedPassword = String(req.body?.password || "");
+
+  if (!configuredPassword) {
+    return res.status(503).json({ error: "Painel administrativo ainda não configurado." });
+  }
+
+  const a = Buffer.from(suppliedPassword);
+  const b = Buffer.from(configuredPassword);
+  const valid = a.length === b.length && crypto.timingSafeEqual(a, b);
+
+  if (!valid) {
+    return res.status(401).json({ error: "Senha inválida." });
+  }
+
+  return res.json({
+    success: true,
+    token: signAdminSession(),
+    expiresInHours: 8,
+  });
+});
+
+app.get("/api/admin/tickets", requireAdmin, async (req, res) => {
+  try {
+    const requestedType = String(req.query.type || "REAL").toUpperCase();
+    const ticketType = ["REAL", "TESTE", "TODOS"].includes(requestedType)
+      ? requestedType
+      : "REAL";
+
+    const tickets = await listTicketsForAdmin({
+      ticketType: ticketType === "TODOS" ? null : ticketType,
+      limit: req.query.limit || 300,
+    });
+
+    return res.json({ success: true, tickets });
+  } catch (error) {
+    console.error("Erro ao listar OS no painel:", { message: error.message });
+    return res.status(500).json({ error: "Não foi possível carregar as OS." });
+  }
+});
+
+app.get("/api/admin/tickets/:id", requireAdmin, async (req, res) => {
+  try {
+    const detail = await getTicketDetailForAdmin(req.params.id);
+    if (!detail) return res.status(404).json({ error: "OS não encontrada." });
+    return res.json({ success: true, ...detail });
+  } catch (error) {
+    console.error("Erro ao carregar OS no painel:", { message: error.message });
+    return res.status(500).json({ error: "Não foi possível carregar os detalhes da OS." });
+  }
 });
 
 app.post("/api/chat", async (req, res) => {
