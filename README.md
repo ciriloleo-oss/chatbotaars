@@ -1,34 +1,51 @@
-# Chatbot AARS - WhatsApp
+# Backend - Railway
 
-Backend Node.js/Express para receber mensagens do WhatsApp Cloud API, classificar com OpenAI e salvar chamados no Supabase.
+Esta versão mantém o webhook do WhatsApp e adiciona o chat web.
 
-## Rodar local
+## Nova rota
+
+`POST /api/chat`
+
+A primeira mensagem cria um ticket e retorna um token de sessão assinado.
+As mensagens seguintes usam o mesmo ticket/protocolo.
+
+## Variáveis novas
+
+Adicione no Railway:
+
+- `WEB_CHAT_SIGNING_SECRET`: uma sequência longa e aleatória.
+- `WEB_ALLOWED_ORIGINS`: depois do deploy do Netlify, use por exemplo:
+  `https://reserva-serra-atendimento.netlify.app`
+
+Se `WEB_ALLOWED_ORIGINS` ficar vazio, o backend aceita qualquer origem durante o teste inicial.
+
+## Instalação local
 
 ```bash
 npm install
 npm run dev
 ```
 
-## Variáveis necessárias no Railway
+## Deploy
 
-- SUPABASE_URL
-- SUPABASE_SERVICE_ROLE_KEY
-- OPENAI_API_KEY
-- OPENAI_MODEL
-- WHATSAPP_ACCESS_TOKEN
-- WHATSAPP_VERIFY_TOKEN
-- WHATSAPP_PHONE_NUMBER_ID
+Substitua os arquivos do projeto atual pelos desta pasta, depois:
 
-## Webhook Meta
-
-Callback URL:
-
-```text
-https://SEU-DOMINIO.up.railway.app/webhook
+```bash
+npm install
+git add .
+git commit -m "Adiciona atendimento web"
+git push
 ```
 
-Verify token:
+O Railway deve fazer o redeploy automaticamente.
 
-```text
-condominio_reserva_serra_token
-```
+## Banco
+
+O código utiliza as tabelas já existentes:
+
+- residents
+- tickets
+- ticket_messages
+- ticket_status_history
+
+Não é necessária migração de banco para este MVP.

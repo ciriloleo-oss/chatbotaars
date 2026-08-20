@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#173f35" />
+  <meta name="description" content="Canal de atendimento aos moradores do Reserva da Serra." />
+  <title>Atendimento Reserva da Serra</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">RS</div>
+        <div>
+          <strong>Reserva da Serra</strong>
+          <span>Atendimento ao Morador</span>
+        </div>
+      </div>
+      <button id="newServiceBtn" class="ghost-btn" type="button" hidden>Novo atendimento</button>
+    </header>
+
+    <main>
+      <section id="welcomeView" class="welcome-view">
+        <div class="hero">
+          <span class="eyebrow">CANAL DE ATENDIMENTO</span>
+          <h1>Como podemos ajudar?</h1>
+          <p>Registre uma solicitação, reclamação, dúvida ou ocorrência. Você receberá um protocolo para acompanhamento.</p>
+        </div>
+
+        <div class="emergency-card">
+          <div class="emergency-icon" aria-hidden="true">!</div>
+          <div>
+            <strong>Emergência ou risco imediato?</strong>
+            <p>Preserve sua segurança. Em situações urgentes, acione também o serviço público apropriado (190, 192 ou 193).</p>
+          </div>
+        </div>
+
+        <form id="profileForm" class="profile-card">
+          <h2>Identificação</h2>
+          <p class="form-intro">Precisamos destes dados para registrar corretamente seu atendimento.</p>
+
+          <label>
+            <span>Nome</span>
+            <input id="nameInput" name="name" type="text" autocomplete="name" placeholder="Seu nome" maxlength="100" required />
+          </label>
+
+          <div class="form-grid">
+            <label>
+              <span>Unidade / Casa</span>
+              <input id="unitInput" name="unit" type="text" placeholder="Ex.: Casa 42" maxlength="60" required />
+            </label>
+
+            <label>
+              <span>Bloco / Setor <small>(opcional)</small></span>
+              <input id="blockInput" name="block" type="text" placeholder="Ex.: Bloco A" maxlength="60" />
+            </label>
+          </div>
+
+          <label>
+            <span>Telefone</span>
+            <input id="phoneInput" name="phone" type="tel" autocomplete="tel" inputmode="tel" placeholder="(11) 99999-9999" maxlength="20" required />
+          </label>
+
+          <label class="consent-row">
+            <input id="consentInput" type="checkbox" required />
+            <span>Concordo com o uso dos dados acima exclusivamente para registrar, encaminhar e acompanhar este atendimento.</span>
+          </label>
+
+          <button class="primary-btn" type="submit">Iniciar atendimento</button>
+        </form>
+      </section>
+
+      <section id="chatView" class="chat-view" hidden>
+        <div class="chat-status">
+          <div>
+            <span class="status-dot"></span>
+            <strong>Assistente Reserva da Serra</strong>
+          </div>
+          <div id="protocolBadge" class="protocol-badge" hidden></div>
+        </div>
+
+        <div id="messageList" class="message-list" role="log" aria-live="polite" aria-label="Conversa"></div>
+
+        <div id="typingIndicator" class="typing" hidden>
+          <span></span><span></span><span></span>
+        </div>
+
+        <form id="messageForm" class="composer">
+          <label for="messageInput" class="sr-only">Digite sua mensagem</label>
+          <textarea id="messageInput" rows="1" maxlength="2000" placeholder="Digite sua solicitação..." required></textarea>
+          <button id="sendBtn" class="send-btn" type="submit" aria-label="Enviar mensagem"><span aria-hidden="true">➤</span></button>
+        </form>
+
+        <p class="chat-note">Não envie senhas, dados bancários ou outras informações sensíveis pelo chat.</p>
+      </section>
+    </main>
+
+    <footer>
+      <span>Reserva da Serra • Atendimento digital</span>
+      <a id="privacyLink" href="#" hidden>Privacidade</a>
+    </footer>
+  </div>
+
+  <script src="./config.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

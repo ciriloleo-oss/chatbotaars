@@ -6,14 +6,14 @@ async function sendWhatsAppMessage(to, text) {
 
   if (!token || !phoneNumberId) {
     console.warn("WhatsApp não configurado.", {
-      to,
-      text,
+      hasToken: Boolean(token),
+      phoneNumberId,
     });
-
     return null;
   }
 
-  const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
+  const graphVersion = process.env.META_GRAPH_VERSION || "v25.0";
+  const url = `https://graph.facebook.com/${graphVersion}/${phoneNumberId}/messages`;
 
   const payload = {
     messaging_product: "whatsapp",
@@ -33,10 +33,10 @@ async function sendWhatsAppMessage(to, text) {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
+      timeout: 15000,
     });
 
     console.log("Resposta WhatsApp enviada:", response.data);
-
     return response.data;
   } catch (error) {
     console.error("Erro ao enviar WhatsApp:", {
