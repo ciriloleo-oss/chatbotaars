@@ -15,26 +15,23 @@ async function sendWhatsAppMessage(to, text) {
   const graphVersion = process.env.META_GRAPH_VERSION || "v25.0";
   const url = `https://graph.facebook.com/${graphVersion}/${phoneNumberId}/messages`;
 
-  const payload = {
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: {
-      preview_url: false,
-      body: text,
-    },
-  };
-
   try {
-    console.log("Enviando WhatsApp para:", to);
-
-    const response = await axios.post(url, payload, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+    const response = await axios.post(
+      url,
+      {
+        messaging_product: "whatsapp",
+        to,
+        type: "text",
+        text: { preview_url: false, body: text },
       },
-      timeout: 15000,
-    });
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 15000,
+      }
+    );
 
     console.log("Resposta WhatsApp enviada:", response.data);
     return response.data;
@@ -44,7 +41,6 @@ async function sendWhatsAppMessage(to, text) {
       data: error.response?.data,
       message: error.message,
     });
-
     throw error;
   }
 }

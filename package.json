@@ -1,11 +1,12 @@
 {
   "name": "chatbotaars",
-  "version": "2.0.0",
-  "description": "Atendimento web e WhatsApp do Reserva da Serra",
+  "version": "3.0.0",
+  "description": "Atendimento digital da Associação dos Amigos do Reserva da Serra",
   "main": "server.js",
   "scripts": {
     "dev": "nodemon server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "knowledge:setup": "node scripts/setupKnowledge.js"
   },
   "engines": {
     "node": "22.x"

@@ -2,3 +2,4 @@
 .env.txt
 node_modules
 npm-debug.log*
+knowledge/official/*.pdf

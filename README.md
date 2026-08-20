@@ -1,51 +1,90 @@
-# Backend - Railway
+# Backend AARS v3 - Railway
 
-Esta versão mantém o webhook do WhatsApp e adiciona o chat web.
+Esta versão transforma o chat em dois fluxos:
 
-## Nova rota
+- **CONSULTA**: responde com base nos documentos oficiais e não abre chamado.
+- **ATENDIMENTO**: registra solicitação/ocorrência e mantém o protocolo.
+- **CONSULTA_ATENDIMENTO**: responde a regra e também registra a ocorrência.
 
-`POST /api/chat`
+A nomenclatura institucional foi alterada para **Associação / Associado**.
 
-A primeira mensagem cria um ticket e retorna um token de sessão assinado.
-As mensagens seguintes usam o mesmo ticket/protocolo.
+## 1. Documentos oficiais
 
-## Variáveis novas
+A pasta local `knowledge/official` contém:
 
-Adicione no Railway:
+- `estatuto-social-aars.pdf`
+- `regulamento-interno-aars.pdf`
 
-- `WEB_CHAT_SIGNING_SECRET`: uma sequência longa e aleatória.
-- `WEB_ALLOWED_ORIGINS`: depois do deploy do Netlify, use por exemplo:
-  `https://reserva-serra-atendimento.netlify.app`
+Esses PDFs estão no `.gitignore` e **não devem ser enviados ao GitHub**.
 
-Se `WEB_ALLOWED_ORIGINS` ficar vazio, o backend aceita qualquer origem durante o teste inicial.
+## 2. Preparar a base documental uma única vez
 
-## Instalação local
+Mantenha sua `.env` local com `OPENAI_API_KEY` e execute:
 
 ```bash
 npm install
-npm run dev
+npm run knowledge:setup
 ```
 
-## Deploy
+O script:
 
-Substitua os arquivos do projeto atual pelos desta pasta, depois:
+1. envia os dois PDFs para o projeto da OpenAI;
+2. cria um Vector Store;
+3. indexa os documentos;
+4. imprime três variáveis.
+
+Copie as variáveis exibidas para o Railway:
+
+```text
+OPENAI_VECTOR_STORE_ID=vs_...
+OPENAI_ESTATUTO_FILE_ID=file_...
+OPENAI_RI_FILE_ID=file_...
+```
+
+O `OPENAI_ESTATUTO_FILE_ID` também é usado como fallback para consultas ao Estatuto, pois o PDF é digitalizado.
+
+## 3. Deploy no Railway
+
+Depois da configuração documental:
 
 ```bash
-npm install
 git add .
-git commit -m "Adiciona atendimento web"
+git commit -m "Adiciona base oficial Estatuto e Regulamento ao chat AARS"
 git push
 ```
 
-O Railway deve fazer o redeploy automaticamente.
+Os PDFs não aparecerão no commit porque estão ignorados.
 
-## Banco
+## 4. Teste de saúde
 
-O código utiliza as tabelas já existentes:
+Abra:
 
-- residents
-- tickets
-- ticket_messages
-- ticket_status_history
+`https://chatbotaars-production.up.railway.app/api/health`
 
-Não é necessária migração de banco para este MVP.
+O esperado é:
+
+```json
+{
+  "ok": true,
+  "service": "AARS Atendimento Digital",
+  "knowledgeConfigured": true
+}
+```
+
+## 5. CORS
+
+Para o site atual do Netlify use no Railway:
+
+```text
+WEB_ALLOWED_ORIGINS=https://aarsac.netlify.app
+```
+
+## Regras de resposta documental
+
+O prompt foi configurado para:
+
+- não inventar ou corrigir regras;
+- preservar distinções existentes nos documentos;
+- citar documento e item/artigo quando a fonte recuperada trouxer a referência;
+- não aplicar penalidades nem declarar culpa;
+- encaminhar para análise humana quando não houver base documental suficiente.

@@ -6,13 +6,7 @@ function generateProtocol() {
   return `RS-${year}-${random}`;
 }
 
-async function createOrUpdateResident({
-  name,
-  phone,
-  unit,
-  block = "",
-  email = null,
-}) {
+async function createOrUpdateResident({ name, phone, unit, block = "", email = null }) {
   const { data: existing, error: selectError } = await supabase
     .from("residents")
     .select("*")
@@ -59,17 +53,11 @@ async function createOrUpdateResident({
   return data;
 }
 
-async function createTicket({
-  residentId,
-  message,
-  classification,
-  source,
-  resident,
-}) {
+async function createTicket({ residentId, message, classification, source, resident }) {
   const protocol = generateProtocol();
 
   const description = [
-    resident?.name ? `Morador: ${resident.name}` : null,
+    resident?.name ? `Associado: ${resident.name}` : null,
     resident?.unit ? `Unidade: ${resident.unit}` : null,
     resident?.block ? `Bloco/Setor: ${resident.block}` : null,
     `Solicitação: ${message}`,
@@ -87,7 +75,6 @@ async function createTicket({
       status: "Novo",
       description,
       summary: classification.summary || message,
-      sentiment: classification.sentiment || null,
       emergency: Boolean(classification.emergency),
       requires_manager: Boolean(classification.requires_manager),
       requires_human: classification.requires_human !== false,
@@ -99,23 +86,24 @@ async function createTicket({
 
   if (error) throw error;
 
-  await supabase.from("ticket_status_history").insert({
-    ticket_id: data.id,
-    old_status: null,
-    new_status: "Novo",
-    changed_by: "chatbot",
-    note: `Chamado criado automaticamente via ${source || "web"}.`,
-  });
+  const { error: historyError } = await supabase
+    .from("ticket_status_history")
+    .insert({
+      ticket_id: data.id,
+      old_status: null,
+      new_status: "Novo",
+      changed_by: "chatbot",
+      note: `Atendimento criado automaticamente via ${source || "web"}.`,
+    });
+
+  if (historyError) {
+    console.warn("Não foi possível gravar histórico inicial do status:", historyError.message);
+  }
 
   return data;
 }
 
-async function appendTicketMessage(
-  ticketId,
-  sender,
-  message,
-  attachmentUrl = null
-) {
+async function appendTicketMessage(ticketId, sender, message, attachmentUrl = null) {
   const { data, error } = await supabase
     .from("ticket_messages")
     .insert({
@@ -133,19 +121,19 @@ async function appendTicketMessage(
 }
 
 async function updateTicketClassification(ticketId, classification) {
+  const updates = {
+    category: classification.category || "Outros",
+    priority: classification.priority || "MÉDIA",
+    summary: classification.summary || null,
+    emergency: Boolean(classification.emergency),
+    requires_manager: Boolean(classification.requires_manager),
+    requires_human: classification.requires_human !== false,
+    assigned_to: classification.responsible || ["Recepção"],
+  };
+
   const { data, error } = await supabase
     .from("tickets")
-    .update({
-      category: classification.category || "Outros",
-      priority: classification.priority || "MÉDIA",
-      summary: classification.summary || null,
-      sentiment: classification.sentiment || null,
-      emergency: Boolean(classification.emergency),
-      requires_manager: Boolean(classification.requires_manager),
-      requires_human: classification.requires_human !== false,
-      assigned_to: classification.responsible || ["Recepção"],
-      updated_at: new Date().toISOString(),
-    })
+    .update(updates)
     .eq("id", ticketId)
     .select()
     .single();
@@ -154,7 +142,7 @@ async function updateTicketClassification(ticketId, classification) {
   return data;
 }
 
-async function getConversationMessages(ticketId, limit = 12) {
+async function getConversationMessages(ticketId, limit = 14) {
   const { data, error } = await supabase
     .from("ticket_messages")
     .select("sender,message,created_at")

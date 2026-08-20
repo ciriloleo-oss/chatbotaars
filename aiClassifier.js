@@ -1,71 +1,79 @@
 const OpenAI = require("openai");
+const institution = require("./institution");
 
 if (!process.env.OPENAI_API_KEY) {
   throw new Error("OPENAI_API_KEY não configurada");
 }
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function normalizeHistory(history = []) {
-  return history
-    .slice(-12)
-    .map((item) => ({
-      sender: item.sender === "assistant" ? "Assistente" : "Morador",
-      message: String(item.message || "").slice(0, 1200),
-    }));
+  return history.slice(-12).map((item) => ({
+    sender:
+      item.sender === "assistant" || item.role === "assistant"
+        ? "Assistente"
+        : "Associado",
+    message: String(item.message || item.text || "").slice(0, 1200),
+  }));
 }
 
-function fallbackClassification(message) {
+function fallback(message) {
   const emergencyRegex =
-    /\b(inc[eê]ndio|pegando fogo|fogo|invas[aã]o|agress[aã]o|amea[cç]a|acidente|viol[eê]ncia|socorro|emerg[eê]ncia)\b/i;
-
+    /\b(inc[eê]ndio|pegando fogo|fogo|invas[aã]o|agress[aã]o|amea[cç]a|acidente|viol[eê]ncia|socorro|emerg[eê]ncia|tentativa de furto)\b/i;
   const emergency = emergencyRegex.test(message);
 
   return {
+    intent: "ATENDIMENTO",
+    document_scope: "NENHUM",
     category: emergency ? "Emergência" : "Outros",
     priority: emergency ? "CRÍTICA" : "MÉDIA",
     responsible: emergency ? ["Supervisor de Segurança"] : ["Recepção"],
     requires_manager: false,
     requires_human: true,
     emergency,
-    sentiment: "Indefinido",
     summary: message.slice(0, 300),
-    missing_information: ["Nome do morador", "Unidade"],
+    intake_complete: emergency,
+    next_question: emergency
+      ? ""
+      : "Pode me dar um pouco mais de detalhe sobre o que aconteceu?",
     suggested_reply: emergency
-      ? "Identificamos uma possível situação de emergência. Preserve sua segurança e mantenha distância do risco. A ocorrência foi registrada para encaminhamento à Segurança."
-      : "Sua solicitação foi recebida e será analisada pela equipe responsável.",
+      ? "Identifiquei uma possível situação de emergência. Preserve sua segurança e mantenha distância do risco."
+      : "Entendi sua solicitação.",
   };
 }
 
-async function classifyMessage(message, history = [], resident = {}) {
+async function classifyInteraction(message, history = [], resident = {}) {
   const context = normalizeHistory(history);
 
   const prompt = `
-Você é o assistente virtual do Reserva da Serra, responsável pelo primeiro atendimento aos moradores.
+Você é o classificador de atendimento da ${institution.legalName} (${institution.shortName}).
+A organização é uma ASSOCIAÇÃO. No atendimento institucional, chame o usuário de ASSOCIADO. Nunca use "condomínio" ou "condômino" como nomenclatura institucional.
 
-DADOS DO MORADOR:
+DADOS JÁ CONHECIDOS:
 Nome: ${resident.name || "não informado"}
 Unidade/Casa: ${resident.unit || "não informada"}
 Bloco/Setor: ${resident.block || "não informado"}
 Telefone: ${resident.phone || "não informado"}
 
 HISTÓRICO RECENTE:
-${context.length ? JSON.stringify(context, null, 2) : "Sem mensagens anteriores."}
+${context.length ? JSON.stringify(context, null, 2) : "Sem histórico."}
 
 MENSAGEM ATUAL:
 ${JSON.stringify(message)}
 
-OBJETIVOS:
-1. Entender o pedido.
-2. Classificar a categoria e prioridade.
-3. Identificar o responsável.
-4. Responder ao morador com clareza e cordialidade.
-5. Solicitar somente as informações realmente necessárias que ainda estiverem faltando.
-6. Em emergência, priorizar segurança. Não espere dados complementares para reconhecer a urgência.
+CLASSIFIQUE A INTENÇÃO:
+- CONSULTA: pergunta sobre regras, horários, direitos, deveres, assembleias, áreas comuns, portaria, obras, animais, trânsito, penalidades, Estatuto ou Regulamento Interno, sem pedido de registrar ocorrência.
+- ATENDIMENTO: relato de problema, solicitação operacional, reclamação, incidente, pedido de providência ou pedido explícito de registro.
+- CONSULTA_ATENDIMENTO: a mensagem ao mesmo tempo pergunta sobre uma regra e relata uma situação que pode exigir providência.
+- CONVERSA: saudação ou mensagem sem conteúdo suficiente para consulta ou atendimento.
 
-CATEGORIAS:
+ESCOPO DOCUMENTAL:
+- RI: regras operacionais e de convivência do Regulamento Interno.
+- ESTATUTO: direitos/deveres estatutários, quadro social, assembleias, administração, governança, contribuições, Regimento Interno e penalidades estatutárias.
+- AMBOS: quando a resposta exige cruzar os dois documentos.
+- NENHUM: quando não é uma consulta documental.
+
+CATEGORIAS DE ATENDIMENTO:
 Segurança
 Emergência
 Barulho
@@ -85,49 +93,48 @@ ENCAMINHAMENTO:
 - Barulho -> Supervisor de Segurança + Gestor
 - Financeiro -> Administrador + Gestor
 - Reclamação / SAC -> Gestor
-- Portaria / Acesso -> Recepção
-- Manutenção -> Recepção
-- Limpeza -> Recepção
-- Área comum -> Recepção
-- Encomendas -> Recepção
-- Sugestão -> Recepção
-- Outros -> Recepção
+- demais categorias -> Recepção, salvo necessidade evidente de outro responsável.
 
-PRIORIDADE CRÍTICA:
-incêndio, fogo, invasão, agressão, ameaça, violência, acidente grave,
-emergência médica, tentativa de furto ou qualquer risco imediato.
+PRIORIDADES:
+- CRÍTICA: incêndio, invasão, agressão, violência, acidente grave, emergência médica, tentativa de furto, ameaça ou risco imediato.
+- ALTA: problema relevante de segurança, portão travado, vazamento grave, falta de energia em área comum, reclamação formal com risco relevante.
+- MÉDIA: barulho, manutenção comum, dúvida financeira, problema operacional sem risco imediato.
+- BAIXA: sugestão, elogio, pedido simples de informação.
 
-PRIORIDADE ALTA:
-problema relevante de segurança, portão travado, vazamento grave,
-falta de energia em área comum, reclamação formal ou ameaça jurídica.
+CONDUÇÃO DO ATENDIMENTO:
+Faça NO MÁXIMO UMA pergunta complementar por resposta. Não peça nome, unidade ou telefone se já foram informados acima.
 
-PRIORIDADE MÉDIA:
-barulho, manutenção comum, dúvida financeira, reclamação sem risco imediato.
+Para BARULHO, priorize nesta ordem:
+1. saber se está acontecendo neste momento;
+2. local aproximado/origem;
+3. horário aproximado de início.
+Não pergunte o que já estiver claro no histórico.
 
-PRIORIDADE BAIXA:
-sugestão, elogio, pedido simples de informação.
+Para SEGURANÇA, descubra local e se há risco imediato. Em emergência, não condicione o registro a perguntas complementares.
 
-REGRAS:
-- Nunca exponha dados pessoais de terceiros.
-- Nunca acuse outro morador como fato.
-- Nunca assuma culpa do condomínio.
-- Não prometa prazo ou solução que não esteja garantida.
-- Em emergência, oriente o morador a preservar a própria segurança e, quando aplicável, acionar serviços públicos de emergência.
-- Não peça novamente nome, telefone ou unidade se eles já constarem nos dados acima.
-- A resposta deve ser curta e adequada para chat no celular.
-- Não invente regras internas do condomínio.
+Para MANUTENÇÃO, descubra local e qual problema foi observado.
+
+Para FINANCEIRO, identifique o assunto (boleto, pagamento, contribuição, cobrança etc.). Nunca peça senha, cartão, dados bancários completos ou credenciais.
+
+Para RECLAMAÇÃO/SAC, obtenha fato, data/horário aproximado e local/setor quando necessários. Não faça interrogatório.
+
+Para PORTARIA/ACESSO, entenda se é visitante, prestador, cadastro, autorização ou falha de acesso.
+
+intake_complete deve ser true quando já há informação mínima suficiente para encaminhamento. Emergência sempre deve ser true.
 
 Retorne SOMENTE JSON válido:
 {
+  "intent": "CONSULTA|ATENDIMENTO|CONSULTA_ATENDIMENTO|CONVERSA",
+  "document_scope": "RI|ESTATUTO|AMBOS|NENHUM",
   "category": "",
-  "priority": "",
+  "priority": "BAIXA|MÉDIA|ALTA|CRÍTICA",
   "responsible": [],
   "requires_manager": false,
-  "requires_human": true,
+  "requires_human": false,
   "emergency": false,
-  "sentiment": "",
   "summary": "",
-  "missing_information": [],
+  "intake_complete": false,
+  "next_question": "",
   "suggested_reply": ""
 }
 `;
@@ -143,21 +150,22 @@ Retorne SOMENTE JSON válido:
     const result = JSON.parse(clean);
 
     return {
+      intent: ["CONSULTA", "ATENDIMENTO", "CONSULTA_ATENDIMENTO", "CONVERSA"].includes(result.intent)
+        ? result.intent
+        : "ATENDIMENTO",
+      document_scope: ["RI", "ESTATUTO", "AMBOS", "NENHUM"].includes(result.document_scope)
+        ? result.document_scope
+        : "NENHUM",
       category: result.category || "Outros",
       priority: result.priority || "MÉDIA",
-      responsible: Array.isArray(result.responsible)
-        ? result.responsible
-        : ["Recepção"],
+      responsible: Array.isArray(result.responsible) ? result.responsible : ["Recepção"],
       requires_manager: Boolean(result.requires_manager),
-      requires_human: result.requires_human !== false,
+      requires_human: Boolean(result.requires_human),
       emergency: Boolean(result.emergency),
-      sentiment: result.sentiment || "neutro",
       summary: result.summary || message.slice(0, 300),
-      missing_information: Array.isArray(result.missing_information)
-        ? result.missing_information
-        : [],
-      suggested_reply:
-        result.suggested_reply || "Sua solicitação foi registrada.",
+      intake_complete: Boolean(result.intake_complete),
+      next_question: String(result.next_question || "").trim(),
+      suggested_reply: String(result.suggested_reply || "Entendi.").trim(),
     };
   } catch (error) {
     console.error("Erro OpenAI/classificação:", {
@@ -165,23 +173,38 @@ Retorne SOMENTE JSON válido:
       status: error.status,
       code: error.code,
     });
-
-    return fallbackClassification(message);
+    return fallback(message);
   }
 }
 
-function buildWebReply(classification, protocol) {
-  let reply =
-    classification.suggested_reply || "Sua solicitação foi registrada.";
-
+function buildOperationalReply(classification, protocol) {
   if (classification.emergency) {
-    return `🚨 POSSÍVEL EMERGÊNCIA\n\n${reply}\n\nProtocolo: ${protocol}`;
+    return [
+      "🚨 POSSÍVEL EMERGÊNCIA",
+      "",
+      classification.suggested_reply ||
+        "Preserve sua segurança e mantenha distância do risco.",
+      "",
+      "Se houver risco imediato à vida, incêndio ou crime em andamento, acione também o serviço público de emergência apropriado.",
+      protocol ? `Protocolo: ${protocol}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
-  return `${reply}\n\nProtocolo: ${protocol}`;
+  if (!classification.intake_complete && classification.next_question) {
+    return `${classification.suggested_reply}\n\n${classification.next_question}`.trim();
+  }
+
+  return [
+    classification.suggested_reply || "Sua solicitação foi registrada.",
+    protocol ? `Protocolo: ${protocol}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 module.exports = {
-  classifyMessage,
-  buildWebReply,
+  classifyInteraction,
+  buildOperationalReply,
 };
