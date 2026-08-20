@@ -1,4 +1,5 @@
 const institution = require("./institution");
+const { naturalizeUserAddress } = require("./languagePolicy");
 const {
   openaiRequest,
   extractOutputText,
@@ -11,7 +12,7 @@ function normalizeHistory(history = []) {
     sender:
       item.sender === "assistant" || item.role === "assistant"
         ? "Assistente"
-        : "Associado",
+        : "Usuário",
     text: String(item.message || item.text || "").slice(0, 1000),
   }));
 }
@@ -55,7 +56,13 @@ function normalizeSources(citations = [], results = []) {
 function buildGroundingPrompt({ question, history, resident, scope }) {
   return `
 Você é o Assistente Virtual da ${institution.legalName} (${institution.shortName}).
-A organização é uma ASSOCIAÇÃO. Dirija-se ao usuário como ASSOCIADO quando precisar usar uma designação institucional. Nunca use "condomínio" ou "condômino" como nomenclatura institucional.
+A organização é uma ASSOCIAÇÃO. Nunca use "condomínio" ou "condômino" como nomenclatura institucional.
+
+TRATAMENTO DA PESSOA:
+- Converse de forma natural e cordial.
+- Pode usar o primeiro nome ocasionalmente, principalmente na saudação ou em uma confirmação importante.
+- NÃO use "Associado" ou "Associada" como título ou vocativo. Nunca escreva "Associado Fulano", "Associada Fulana", "Sr. Associado" ou equivalentes.
+- Use "associado", "morador", "locatário", "dependente", "visitante" ou "prestador" somente quando essa condição for necessária para explicar corretamente a regra documental.
 
 Sua tarefa é responder EXCLUSIVAMENTE com base nos documentos oficiais disponibilizados pela AARS.
 
@@ -65,7 +72,7 @@ DOCUMENTOS OFICIAIS:
 
 ESCOPO PROVÁVEL DA PERGUNTA: ${scope || "AMBOS"}
 
-DADOS DO ASSOCIADO:
+DADOS DA PESSOA ATENDIDA:
 Nome: ${resident?.name || "não informado"}
 Unidade/Casa: ${resident?.unit || "não informada"}
 
@@ -122,7 +129,7 @@ async function searchOfficialKnowledge({ question, history = [], resident = {}, 
     body: JSON.stringify(body),
   });
 
-  const answer = extractOutputText(response);
+  const answer = naturalizeUserAddress(extractOutputText(response), resident?.name);
   const results = extractFileSearchResults(response);
   const citations = extractFileCitations(response);
   const sources = normalizeSources(citations, results);
@@ -175,7 +182,7 @@ async function directPdfFallback({ question, history = [], resident = {}, scope 
     }),
   });
 
-  const answer = extractOutputText(response);
+  const answer = naturalizeUserAddress(extractOutputText(response), resident?.name);
   const citations = extractFileCitations(response);
 
   return {

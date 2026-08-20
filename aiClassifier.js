@@ -1,5 +1,10 @@
 const OpenAI = require("openai");
 const institution = require("./institution");
+const {
+  naturalizeUserAddress,
+  statementWithoutQuestions,
+  singleQuestion,
+} = require("./languagePolicy");
 
 if (!process.env.OPENAI_API_KEY) {
   throw new Error("OPENAI_API_KEY não configurada");
@@ -12,7 +17,7 @@ function normalizeHistory(history = []) {
     sender:
       item.sender === "assistant" || item.role === "assistant"
         ? "Assistente"
-        : "Associado",
+        : "Usuário",
     message: String(item.message || item.text || "").slice(0, 1200),
   }));
 }
@@ -47,7 +52,14 @@ async function classifyInteraction(message, history = [], resident = {}) {
 
   const prompt = `
 Você é o classificador de atendimento da ${institution.legalName} (${institution.shortName}).
-A organização é uma ASSOCIAÇÃO. No atendimento institucional, chame o usuário de ASSOCIADO. Nunca use "condomínio" ou "condômino" como nomenclatura institucional.
+A organização é uma ASSOCIAÇÃO. Nunca use "condomínio" ou "condômino" como nomenclatura institucional.
+
+TRATAMENTO DA PESSOA:
+- Em conversa direta, use o primeiro nome de forma natural quando fizer sentido.
+- NÃO use "Associado" ou "Associada" como título, pronome de tratamento ou vocativo.
+- Nunca escreva "Associado Fulano", "Associada Fulana", "Sr. Associado" ou equivalentes.
+- O termo "associado" deve aparecer apenas quando necessário para explicar uma condição ou regra institucional, por exemplo: "o associado responsável pela reserva".
+- Não repita o nome em todas as respostas. Prefira uma conversa natural.
 
 DADOS JÁ CONHECIDOS:
 Nome: ${resident.name || "não informado"}
@@ -103,6 +115,13 @@ PRIORIDADES:
 
 CONDUÇÃO DO ATENDIMENTO:
 Faça NO MÁXIMO UMA pergunta complementar por resposta. Não peça nome, unidade ou telefone se já foram informados acima.
+
+REGRAS PARA EVITAR REPETIÇÃO:
+- Se houver uma pergunta complementar, coloque a pergunta SOMENTE em next_question.
+- suggested_reply deve conter apenas uma confirmação/introdução curta, SEM pergunta.
+- Nunca repita em suggested_reply a mesma informação solicitada em next_question, mesmo com palavras diferentes.
+- Antes de definir next_question, verifique a MENSAGEM ATUAL e o HISTÓRICO. Se o usuário acabou de responder à pergunta anterior, considere essa informação já coletada e avance para o próximo dado realmente necessário.
+- Não faça duas perguntas equivalentes na mesma resposta.
 
 Para BARULHO, priorize nesta ordem:
 1. saber se está acontecendo neste momento;
@@ -164,8 +183,15 @@ Retorne SOMENTE JSON válido:
       emergency: Boolean(result.emergency),
       summary: result.summary || message.slice(0, 300),
       intake_complete: Boolean(result.intake_complete),
-      next_question: String(result.next_question || "").trim(),
-      suggested_reply: String(result.suggested_reply || "Entendi.").trim(),
+      next_question: singleQuestion(result.next_question || "", resident.name),
+      suggested_reply: (() => {
+        const nextQuestion = singleQuestion(result.next_question || "", resident.name);
+        const rawReply = String(result.suggested_reply || "Entendi.").trim();
+        const cleaned = nextQuestion
+          ? statementWithoutQuestions(rawReply, resident.name)
+          : naturalizeUserAddress(rawReply, resident.name);
+        return cleaned || "Entendi.";
+      })(),
     };
   } catch (error) {
     console.error("Erro OpenAI/classificação:", {
