@@ -53,7 +53,7 @@ async function createOrUpdateResident({ name, phone, unit, block = "", email = n
   return data;
 }
 
-async function createTicket({ residentId, message, classification, source, resident }) {
+async function createTicket({ residentId, message, classification, source, resident, ticketType = "REAL" }) {
   const protocol = generateProtocol();
 
   const description = [
@@ -80,6 +80,7 @@ async function createTicket({ residentId, message, classification, source, resid
       requires_human: classification.requires_human !== false,
       assigned_to: classification.responsible || ["Recepção"],
       source: source || "web",
+      ticket_type: ticketType === "TESTE" ? "TESTE" : "REAL",
     })
     .select()
     .single();
@@ -93,7 +94,7 @@ async function createTicket({ residentId, message, classification, source, resid
       old_status: null,
       new_status: "Novo",
       changed_by: "chatbot",
-      note: `Atendimento criado automaticamente via ${source || "web"}.`,
+      note: `${ticketType === "TESTE" ? "[TESTE] " : ""}Atendimento criado automaticamente via ${source || "web"}.`,
     });
 
   if (historyError) {

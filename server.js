@@ -20,6 +20,7 @@ const {
   buildOperationalReply,
 } = require("./aiClassifier");
 const { answerFromOfficialDocuments } = require("./knowledgeService");
+const { enforceNewConversationIntent, resolveTicketType } = require("./interactionPolicy");
 const { sendWhatsAppMessage } = require("./whatsappService");
 
 const app = express();
@@ -185,7 +186,13 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const contextHistory = ticket ? databaseHistory : clientHistory;
-    const classification = await classifyInteraction(message, contextHistory, resident);
+    let classification = await classifyInteraction(message, contextHistory, resident);
+
+    // Em uma nova conversa, aplica uma trava determinística para impedir que
+    // perguntas documentais claras virem OS por erro de classificação do modelo.
+    if (!ticket) {
+      classification = enforceNewConversationIntent(classification, message);
+    }
 
     if (classification.intent === "CONVERSA" && !ticket) {
       return res.json({
@@ -230,12 +237,14 @@ app.post("/api/chat", async (req, res) => {
       await updateTicketClassification(ticket.id, classification);
     } else {
       const residentRecord = await createOrUpdateResident(resident);
+      const ticketType = resolveTicketType(resident);
       ticket = await createTicket({
         residentId: residentRecord.id,
         message,
         classification,
         source: "web",
         resident,
+        ticketType,
       });
       await appendTicketMessage(ticket.id, "resident", message);
     }
@@ -266,6 +275,7 @@ app.post("/api/chat", async (req, res) => {
       intakeComplete: classification.intake_complete,
       grounded: Boolean(knowledge?.grounded),
       sources: knowledge?.sources || [],
+      ticketType: ticket?.ticket_type || null,
     });
   } catch (error) {
     console.error("Erro no chat web:", {
@@ -324,7 +334,8 @@ app.post("/webhook", async (req, res) => {
     const phone = whatsappMessage.from;
     const text = whatsappMessage.text?.body || "";
     const resident = { name: "Associado", phone, unit: "Não informada", block: "" };
-    const classification = await classifyInteraction(text, [], resident);
+    let classification = await classifyInteraction(text, [], resident);
+    classification = enforceNewConversationIntent(classification, text);
 
     if (classification.intent === "CONSULTA") {
       const knowledge = await answerFromOfficialDocuments({
@@ -337,12 +348,14 @@ app.post("/webhook", async (req, res) => {
     }
 
     const residentRecord = await createOrUpdateResident(resident);
+    const ticketType = resolveTicketType(resident);
     const ticket = await createTicket({
       residentId: residentRecord.id,
       message: text,
       classification,
       source: "whatsapp",
       resident,
+      ticketType,
     });
     await appendTicketMessage(ticket.id, "resident", text, whatsappMessage.id);
 
