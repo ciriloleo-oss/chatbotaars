@@ -23,6 +23,7 @@ const { answerFromOfficialDocuments } = require("./knowledgeService");
 const { enforceNewConversationIntent, resolveTicketType } = require("./interactionPolicy");
 const { sendWhatsAppMessage } = require("./whatsappService");
 const { listTicketsForAdmin, getTicketDetailForAdmin } = require("./adminService");
+const { sendWhatsAppReturnForAdmin } = require("./whatsappReturnService");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -260,6 +261,17 @@ app.get("/api/admin/tickets/:id", requireAdmin, async (req, res) => {
   } catch (error) {
     console.error("Erro ao carregar OS no painel:", { message: error.message });
     return res.status(500).json({ error: "Não foi possível carregar os detalhes da OS." });
+  }
+});
+
+app.post("/api/admin/tickets/:id/whatsapp", requireAdmin, async (req, res) => {
+  try {
+    const result = await sendWhatsAppReturnForAdmin(req.params.id, req.body?.message);
+    return res.json(result);
+  } catch (error) {
+    console.error("Erro ao enviar retorno da OS por WhatsApp:", { message: error.message });
+    const status = Number(error.statusCode) || 500;
+    return res.status(status).json({ error: error.message || "Não foi possível enviar o WhatsApp." });
   }
 });
 
