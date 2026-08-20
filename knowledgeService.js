@@ -6,6 +6,11 @@ const {
   extractFileCitations,
   extractFileSearchResults,
 } = require("./openaiHttp");
+const {
+  detectKnowledgeTopic,
+  buildTopicInstruction,
+  answerLeaksTopic,
+} = require("./knowledgeTopics");
 
 function normalizeHistory(history = []) {
   return history.slice(-8).map((item) => ({
@@ -55,7 +60,7 @@ function normalizeSources(citations = [], results = []) {
   return [...unique.values()].slice(0, 4);
 }
 
-function retrievalHints(question = "") {
+function retrievalHints(question = "", topic = null) {
   const q = String(question).toLowerCase();
   const hints = [];
 
@@ -95,6 +100,8 @@ function retrievalHints(question = "") {
   if (/multa|penalidade|infra[cç][aã]o|advert[eê]ncia|recurso/.test(q)) {
     hints.push("penalidades e defesas; tabela de infrações; artigo 53 do Estatuto");
   }
+
+  if (topic?.focus) hints.unshift(topic.focus);
 
   return hints.join(" | ");
 }
@@ -144,9 +151,140 @@ function postProcessAnswer(rawAnswer, resident, history) {
   return stripRepeatedGreeting(natural, resident?.name, history);
 }
 
-function buildGroundingPrompt({ question, history, resident, scope }) {
+
+function parseJsonObject(raw = "") {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+
+  const cleaned = text
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(cleaned.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+async function focusedDirectTopicLookup({
+  question,
+  history = [],
+  resident = {},
+  scope = "RI",
+  topic,
+}) {
+  if (!topic) return { grounded: false, answer: "", sources: [] };
+
+  const fileId =
+    scope === "ESTATUTO"
+      ? process.env.OPENAI_ESTATUTO_FILE_ID
+      : process.env.OPENAI_RI_FILE_ID;
+
+  if (!fileId) {
+    return { grounded: false, answer: "", sources: [] };
+  }
+
   const normalizedHistory = normalizeHistory(history);
-  const hints = retrievalHints(question);
+  const topicInstruction = buildTopicInstruction(topic);
+
+  const prompt = `
+Você fará uma verificação documental estrita para a ${institution.shortName}.
+Analise diretamente o PDF oficial anexado.
+
+PERGUNTA ATUAL:
+${JSON.stringify(question)}
+
+HISTÓRICO RECENTE:
+${JSON.stringify(normalizedHistory, null, 2)}
+
+${topicInstruction}
+
+REGRAS DE VERIFICAÇÃO:
+1. Localize primeiro o título/seção correspondente ao ALVO DOCUMENTAL OBRIGATÓRIO.
+2. Só depois extraia a regra que responde à pergunta.
+3. Não use números, horários, limites, reservas, convidados ou condições de uma seção vizinha.
+4. Uma página pode conter o final de uma seção e o começo de outra. Confira a numeração do item antes de usar qualquer informação.
+5. Se o usuário empregar um apelido que não aparece como nome de instalação no documento, não transforme uma ocorrência incidental da palavra em nome oficial.
+6. Não use conhecimento geral.
+7. Não invente item ou artigo.
+8. Responda de forma curta e natural, sem saudação e sem usar "Associado" como vocativo.
+
+Retorne SOMENTE JSON válido neste formato:
+{
+  "grounded": true,
+  "needs_clarification": false,
+  "reference": "item ou artigo exato, sem inventar",
+  "answer": "resposta direta, sem linha de fonte"
+}
+
+Se a seção correta não sustentar a resposta, use grounded=false.
+Se a pergunta depender de esclarecer qual instalação o usuário quis dizer, use needs_clarification=true e coloque em answer uma única pergunta breve de esclarecimento.
+`;
+
+  const response = await openaiRequest("/responses", {
+    method: "POST",
+    body: JSON.stringify({
+      model:
+        process.env.OPENAI_KNOWLEDGE_MODEL ||
+        process.env.OPENAI_MODEL ||
+        "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: prompt },
+            { type: "input_file", file_id: fileId },
+          ],
+        },
+      ],
+    }),
+  });
+
+  const parsed = parseJsonObject(extractOutputText(response));
+  if (!parsed || parsed.grounded !== true || !parsed.answer) {
+    return { grounded: false, answer: "", sources: [] };
+  }
+
+  let answer = postProcessAnswer(parsed.answer, resident, history);
+  if (answerLeaksTopic(answer, topic)) {
+    console.warn("Base documental: resposta focada rejeitada por mistura de assunto.", {
+      topic: topic.key,
+    });
+    return { grounded: false, answer: "", sources: [] };
+  }
+
+  const reference = String(parsed.reference || "").trim();
+  const label = scope === "ESTATUTO" ? "Estatuto Social" : "Regulamento Interno";
+
+  if (!parsed.needs_clarification) {
+    answer = `${answer}\n\nFonte: ${label}${reference ? ` — ${reference}` : ""}`;
+  }
+
+  return {
+    grounded: true,
+    answer,
+    sources: [{ fileId, label, filename: label }],
+    focused: true,
+    needsClarification: Boolean(parsed.needs_clarification),
+  };
+}
+
+function buildGroundingPrompt({ question, history, resident, scope, topic = null }) {
+  const normalizedHistory = normalizeHistory(history);
+  const hints = retrievalHints(question, topic);
+  const topicInstruction = buildTopicInstruction(topic);
 
   return `
 Você é o Assistente Virtual da ${institution.legalName} (${institution.shortName}).
@@ -164,6 +302,8 @@ Sua tarefa é responder EXCLUSIVAMENTE com base nos documentos oficiais disponib
 DOCUMENTOS OFICIAIS:
 - Estatuto Social da Associação dos Amigos do Reserva da Serra.
 - Regulamento Interno vigente do Reserva da Serra, incluindo sua tabela de infrações.
+
+${topicInstruction}
 
 ESCOPO PROVÁVEL DA PERGUNTA: ${scope || "AMBOS"}
 
@@ -204,7 +344,10 @@ async function searchOfficialKnowledge({
   history = [],
   resident = {},
   scope = "AMBOS",
+  topic = null,
 }) {
+  topic = topic || detectKnowledgeTopic(question);
+  const effectiveScope = topic?.scope || scope;
   const vectorStoreId = process.env.OPENAI_VECTOR_STORE_ID;
   if (!vectorStoreId) {
     return {
@@ -220,7 +363,13 @@ async function searchOfficialKnowledge({
       process.env.OPENAI_KNOWLEDGE_MODEL ||
       process.env.OPENAI_MODEL ||
       "gpt-4.1-mini",
-    input: buildGroundingPrompt({ question, history, resident, scope }),
+    input: buildGroundingPrompt({
+      question,
+      history,
+      resident,
+      scope: effectiveScope,
+      topic,
+    }),
     tools: [
       {
         type: "file_search",
@@ -244,7 +393,10 @@ async function searchOfficialKnowledge({
   const results = extractFileSearchResults(response);
   const citations = extractFileCitations(response);
   const sources = normalizeSources(citations, results);
-  const grounded = Boolean(answer) && !hasNegativeGroundingSignal(answer);
+  const grounded =
+    Boolean(answer) &&
+    !hasNegativeGroundingSignal(answer) &&
+    !answerLeaksTopic(answer, topic);
 
   return {
     available: true,
@@ -262,7 +414,10 @@ async function directPdfFallback({
   history = [],
   resident = {},
   scope = "AMBOS",
+  topic = null,
 }) {
+  topic = topic || detectKnowledgeTopic(question);
+  scope = topic?.scope || scope;
   const fileIds = [];
 
   if (scope === "ESTATUTO" || scope === "AMBOS") {
@@ -293,6 +448,7 @@ async function directPdfFallback({
         history,
         resident,
         scope,
+        topic,
       })}\n\nA busca vetorial anterior não foi conclusiva. Analise diretamente os PDFs oficiais anexados nesta solicitação antes de concluir que não existe previsão.`,
     },
     ...fileIds.map((fileId) => ({ type: "input_file", file_id: fileId })),
@@ -315,7 +471,10 @@ async function directPdfFallback({
     history
   );
   const citations = extractFileCitations(response);
-  const grounded = Boolean(answer) && !hasNegativeGroundingSignal(answer);
+  const grounded =
+    Boolean(answer) &&
+    !hasNegativeGroundingSignal(answer) &&
+    !answerLeaksTopic(answer, topic);
 
   return {
     grounded,
@@ -328,12 +487,39 @@ async function directPdfFallback({
 
 async function answerFromOfficialDocuments(args) {
   try {
-    const primary = await searchOfficialKnowledge(args);
+    const topic = detectKnowledgeTopic(args?.question || "");
+    const scopedArgs = {
+      ...args,
+      scope: topic?.scope || args?.scope || "AMBOS",
+      topic,
+    };
+
+    if (topic) {
+      console.log("Base documental: assunto identificado.", {
+        topic: topic.key,
+        focus: topic.focus,
+      });
+    }
+
+    // Para instalações e áreas com seções próprias no RI, prioriza leitura direta
+    // da seção correta. Isso reduz mistura de horários/regras entre chunks vizinhos.
+    if (topic?.directPdfFirst) {
+      const focused = await focusedDirectTopicLookup(scopedArgs);
+      if (focused.grounded) {
+        return { available: true, ...focused };
+      }
+
+      console.log("Base documental: leitura focada inconclusiva; tentando busca vetorial.", {
+        topic: topic.key,
+      });
+    }
+
+    const primary = await searchOfficialKnowledge(scopedArgs);
     if (primary.grounded) return primary;
 
     console.log("Base documental: busca vetorial inconclusiva; usando leitura direta do PDF.");
 
-    const fallback = await directPdfFallback(args);
+    const fallback = await directPdfFallback(scopedArgs);
     if (fallback.grounded) return { available: true, ...fallback };
 
     return {
@@ -341,7 +527,6 @@ async function answerFromOfficialDocuments(args) {
       grounded: false,
       answer:
         "Não localizei nos documentos oficiais uma previsão específica que responda a essa situação com segurança. Posso registrar a dúvida para análise da Associação.",
-      // Não exibe uma fonte como se ela sustentasse uma resposta que não foi encontrada.
       sources: [],
     };
   } catch (error) {
