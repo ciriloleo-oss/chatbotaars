@@ -12,8 +12,11 @@ const {
   createTicket,
   appendTicketMessage,
   updateTicketClassification,
+  ensureTicketConversationId,
   getConversationMessages,
+  getStaffRepliesForTickets,
   getTicketById,
+  getTicketsByIds,
 } = require("./ticketService");
 const {
   classifyInteraction,
@@ -22,8 +25,9 @@ const {
 const { answerFromOfficialDocuments } = require("./knowledgeService");
 const { enforceNewConversationIntent, resolveTicketType } = require("./interactionPolicy");
 const { sendWhatsAppMessage } = require("./whatsappService");
-const { listTicketsForAdmin, getTicketDetailForAdmin } = require("./adminService");
+const { listTicketsForAdmin, getTicketDetailForAdmin, replyToTicketForAdmin } = require("./adminService");
 const { sendWhatsAppReturnForAdmin } = require("./whatsappReturnService");
+const { planTicketRouting } = require("./ticketRouting");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -73,12 +77,44 @@ function base64url(value) {
   return Buffer.from(value).toString("base64url");
 }
 
-function signSession(ticket) {
+function uniqueTicketIds(values = []) {
+  return [...new Set((Array.isArray(values) ? values : []).filter(Boolean))].slice(-12);
+}
+
+function normalizeSessionState(payload = {}) {
+  const legacyId = payload.ticketId || null;
+  const ticketIds = uniqueTicketIds(
+    Array.isArray(payload.ticketIds) && payload.ticketIds.length
+      ? payload.ticketIds
+      : legacyId
+        ? [legacyId]
+        : []
+  );
+
+  let activeTicketId = payload.activeTicketId || legacyId || ticketIds[ticketIds.length - 1] || null;
+  if (activeTicketId && !ticketIds.includes(activeTicketId)) {
+    activeTicketId = ticketIds[ticketIds.length - 1] || null;
+  }
+
+  return {
+    ticketIds,
+    activeTicketId,
+    conversationId: payload.conversationId || null,
+  };
+}
+
+function signSessionState(state = {}) {
+  const normalized = normalizeSessionState(state);
+  if (!normalized.ticketIds.length) return null;
+
   const payload = {
-    ticketId: ticket.id,
-    protocol: ticket.protocol,
+    v: 2,
+    ticketIds: normalized.ticketIds,
+    activeTicketId: normalized.activeTicketId,
+    conversationId: normalized.conversationId || null,
     exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
   };
+
   const encoded = base64url(JSON.stringify(payload));
   const signature = crypto
     .createHmac("sha256", signingSecret)
@@ -102,8 +138,11 @@ function verifySession(token) {
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
 
     const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
-    if (!payload.ticketId || !payload.exp || payload.exp < Date.now()) return null;
-    return payload;
+    if (!payload.exp || payload.exp < Date.now()) return null;
+
+    const state = normalizeSessionState(payload);
+    if (!state.ticketIds.length) return null;
+    return { ...payload, ...state };
   } catch {
     return null;
   }
@@ -194,6 +233,125 @@ function combineHybrid(knowledgeAnswer, operationalReply) {
   return [knowledgeAnswer, operationalReply].filter(Boolean).join("\n\n---\n\n");
 }
 
+
+function priorityRank(value = "") {
+  const text = String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase();
+  if (text.includes("CRIT")) return 4;
+  if (text.includes("ALT")) return 3;
+  if (text.includes("MED")) return 2;
+  if (text.includes("BAIX")) return 1;
+  return 2;
+}
+
+function mergeClassificationForExistingTicket(ticket, classification = {}) {
+  const incomingCategory = classification.category || ticket.category || "Outros";
+  const preserveCategory =
+    ticket.category &&
+    ticket.category !== "Outros" &&
+    incomingCategory === "Outros";
+
+  const incomingSummary = String(classification.summary || "").trim();
+  const genericSummary =
+    incomingSummary.length < 24 ||
+    /^(sim|não|nao|ok|certo|correto|registro|registrar|conforme|informado|local|próximo|proximo)\b/i.test(incomingSummary);
+
+  const incomingResponsible = Array.isArray(classification.responsible)
+    ? classification.responsible
+    : [];
+  const existingResponsible = Array.isArray(ticket.assigned_to) ? ticket.assigned_to : [];
+  const preserveResponsible =
+    preserveCategory &&
+    incomingResponsible.length === 1 &&
+    incomingResponsible[0] === "Recepção" &&
+    existingResponsible.length;
+
+  const priority =
+    priorityRank(classification.priority) >= priorityRank(ticket.priority)
+      ? classification.priority || ticket.priority
+      : ticket.priority;
+
+  return {
+    ...classification,
+    category: preserveCategory ? ticket.category : incomingCategory,
+    priority,
+    summary: genericSummary ? ticket.summary || incomingSummary : incomingSummary,
+    responsible: preserveResponsible ? existingResponsible : incomingResponsible,
+    emergency: Boolean(ticket.emergency || classification.emergency),
+    requires_manager: Boolean(ticket.requires_manager || classification.requires_manager),
+    requires_human: classification.requires_human !== false,
+  };
+}
+
+async function hydrateSessionState(sessionPayload) {
+  if (!sessionPayload) {
+    return {
+      state: { ticketIds: [], activeTicketId: null, conversationId: null },
+      tickets: [],
+      activeTicket: null,
+    };
+  }
+
+  const tickets = await getTicketsByIds(sessionPayload.ticketIds);
+  if (!tickets.length) return null;
+
+  const validIds = new Set(tickets.map((ticket) => ticket.id));
+  const ticketIds = sessionPayload.ticketIds.filter((id) => validIds.has(id));
+  const activeTicketId = validIds.has(sessionPayload.activeTicketId)
+    ? sessionPayload.activeTicketId
+    : ticketIds[ticketIds.length - 1];
+  const activeTicket = tickets.find((ticket) => ticket.id === activeTicketId) || tickets[tickets.length - 1];
+
+  return {
+    state: {
+      ticketIds,
+      activeTicketId: activeTicket?.id || null,
+      conversationId:
+        sessionPayload.conversationId ||
+        tickets.find((ticket) => ticket.conversation_id)?.conversation_id ||
+        null,
+    },
+    tickets,
+    activeTicket,
+  };
+}
+
+async function ensureConversationId(state, tickets = []) {
+  if (state.conversationId) return state.conversationId;
+
+  const inherited = tickets.find((ticket) => ticket.conversation_id)?.conversation_id || null;
+  const conversationId = inherited || crypto.randomUUID();
+  state.conversationId = conversationId;
+
+  for (const ticket of tickets) {
+    if (!ticket.conversation_id) {
+      await ensureTicketConversationId(ticket.id, conversationId);
+      ticket.conversation_id = conversationId;
+    }
+  }
+
+  return conversationId;
+}
+
+function buildRoutedOperationalReply(classification, ticket, isNewTopic, hadExistingTickets) {
+  let reply = buildOperationalReply(classification, ticket.protocol);
+
+  if (isNewTopic && hadExistingTickets) {
+    const intro = "Separei este assunto em uma nova solicitação para que ele possa ser acompanhado de forma independente.";
+    if (!reply.includes(ticket.protocol)) {
+      reply = `${intro}\n\n${reply}\n\nProtocolo: ${ticket.protocol}`.trim();
+    } else {
+      reply = `${intro}\n\n${reply}`.trim();
+    }
+  }
+
+  return reply;
+}
+
+function sessionProtocols(tickets = [], ids = []) {
+  const map = new Map(tickets.map((ticket) => [ticket.id, ticket.protocol]));
+  return ids.map((id) => map.get(id)).filter(Boolean);
+}
+
 app.get("/", (req, res) => {
   res.status(200).send(`${institution.shortName} - Atendimento digital online`);
 });
@@ -264,6 +422,30 @@ app.get("/api/admin/tickets/:id", requireAdmin, async (req, res) => {
   }
 });
 
+
+app.post("/api/admin/tickets/:id/reply", requireAdmin, async (req, res) => {
+  try {
+    const message = String(req.body?.message || "").trim();
+    const status = req.body?.status ? String(req.body.status) : null;
+
+    if (!message) return res.status(400).json({ error: "Digite uma mensagem para o associado." });
+    if (message.length > 3000) return res.status(400).json({ error: "A mensagem ultrapassa o limite permitido." });
+
+    const detail = await replyToTicketForAdmin({
+      ticketId: req.params.id,
+      message,
+      status,
+      changedBy: "admin",
+    });
+
+    if (!detail) return res.status(404).json({ error: "OS não encontrada." });
+    return res.json({ success: true, ...detail });
+  } catch (error) {
+    console.error("Erro ao enviar retorno ao associado:", { message: error.message });
+    return res.status(500).json({ error: "Não foi possível enviar o retorno ao associado." });
+  }
+});
+
 app.post("/api/admin/tickets/:id/whatsapp", requireAdmin, async (req, res) => {
   try {
     const result = await sendWhatsAppReturnForAdmin(req.params.id, req.body?.message);
@@ -272,6 +454,38 @@ app.post("/api/admin/tickets/:id/whatsapp", requireAdmin, async (req, res) => {
     console.error("Erro ao enviar retorno da OS por WhatsApp:", { message: error.message });
     const status = Number(error.statusCode) || 500;
     return res.status(status).json({ error: error.message || "Não foi possível enviar o WhatsApp." });
+  }
+});
+
+app.get("/api/chat/replies", async (req, res) => {
+  try {
+    const auth = String(req.headers.authorization || "");
+    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    const sessionPayload = verifySession(token);
+    if (!sessionPayload) {
+      return res.status(401).json({ error: "A sessão deste atendimento expirou." });
+    }
+
+    const hydrated = await hydrateSessionState(sessionPayload);
+    if (!hydrated) return res.status(404).json({ error: "Atendimento não encontrado." });
+
+    const { state, tickets, activeTicket } = hydrated;
+    const replies = await getStaffRepliesForTickets(state.ticketIds, 200);
+    const protocolMap = new Map(tickets.map((ticket) => [ticket.id, ticket.protocol]));
+
+    return res.json({
+      success: true,
+      protocol: activeTicket?.protocol || null,
+      status: activeTicket?.status || null,
+      protocols: sessionProtocols(tickets, state.ticketIds),
+      replies: replies.map((reply) => ({
+        ...reply,
+        protocol: protocolMap.get(reply.ticket_id) || null,
+      })),
+    });
+  } catch (error) {
+    console.error("Erro ao consultar retornos do atendimento:", { message: error.message });
+    return res.status(500).json({ error: "Não foi possível consultar novos retornos." });
   }
 });
 
@@ -285,9 +499,11 @@ app.post("/api/chat", async (req, res) => {
     const validationError = validateWebRequest(resident, message);
     if (validationError) return res.status(400).json({ error: validationError });
 
-    let ticket = null;
-    let databaseHistory = [];
     let sessionPayload = null;
+    let sessionState = { ticketIds: [], activeTicketId: null, conversationId: null };
+    let tickets = [];
+    let activeTicket = null;
+    let activeHistory = [];
 
     if (sessionToken) {
       sessionPayload = verifySession(sessionToken);
@@ -297,30 +513,39 @@ app.post("/api/chat", async (req, res) => {
         });
       }
 
-      ticket = await getTicketById(sessionPayload.ticketId);
-      if (!ticket) {
+      const hydrated = await hydrateSessionState(sessionPayload);
+      if (!hydrated) {
         return res.status(404).json({
           error: "Atendimento não encontrado. Inicie um novo atendimento.",
         });
       }
-      databaseHistory = await getConversationMessages(ticket.id, 14);
+
+      sessionState = hydrated.state;
+      tickets = hydrated.tickets;
+      activeTicket = hydrated.activeTicket;
+      if (activeTicket) activeHistory = await getConversationMessages(activeTicket.id, 14);
     }
 
-    const contextHistory = ticket ? databaseHistory : clientHistory;
+    // O histórico do navegador representa a conversa inteira, inclusive consultas
+    // que propositalmente não são gravadas dentro de uma OS. Se ele não estiver
+    // disponível, usamos o histórico da OS ativa como fallback.
+    const contextHistory = clientHistory.length ? clientHistory : activeHistory;
     let classification = await classifyInteraction(message, contextHistory, resident);
 
-    // Em uma nova conversa, aplica uma trava determinística para impedir que
-    // perguntas documentais claras virem OS por erro de classificação do modelo.
-    if (!ticket) {
-      classification = enforceNewConversationIntent(classification, message);
-    }
+    // A trava documental agora vale também quando já existe uma OS na sessão.
+    // Assim, uma pergunta sobre RI/Estatuto não contamina a solicitação operacional ativa.
+    classification = enforceNewConversationIntent(classification, message);
 
-    if (classification.intent === "CONVERSA" && !ticket) {
+    const currentSessionToken = () =>
+      sessionState.ticketIds.length ? signSessionState(sessionState) : null;
+
+    if (classification.intent === "CONVERSA") {
       return res.json({
         success: true,
         reply: conversationReply(resident),
-        protocol: null,
-        sessionToken: null,
+        protocol: activeTicket?.protocol || null,
+        protocols: sessionProtocols(tickets, sessionState.ticketIds),
+        sessionToken: currentSessionToken(),
         intent: classification.intent,
         sources: [],
       });
@@ -339,26 +564,55 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    if (classification.intent === "CONSULTA" && !ticket) {
+    if (classification.intent === "CONSULTA") {
       return res.json({
         success: true,
-        reply: knowledge?.answer ||
+        reply:
+          knowledge?.answer ||
           "Não consegui consultar os documentos oficiais agora. Posso registrar a dúvida para análise da Associação.",
-        protocol: null,
-        sessionToken: null,
+        protocol: activeTicket?.protocol || null,
+        protocols: sessionProtocols(tickets, sessionState.ticketIds),
+        sessionToken: currentSessionToken(),
         intent: classification.intent,
         grounded: Boolean(knowledge?.grounded),
         sources: knowledge?.sources || [],
       });
     }
 
-    // Se já existe ticket, toda nova mensagem permanece no mesmo atendimento.
-    if (ticket) {
-      await appendTicketMessage(ticket.id, "resident", message);
-      await updateTicketClassification(ticket.id, classification);
-    } else {
-      const residentRecord = await createOrUpdateResident(resident);
-      const ticketType = resolveTicketType(resident);
+    const hadExistingTickets = tickets.length > 0;
+    const residentRecord = await createOrUpdateResident(resident);
+    const ticketType = resolveTicketType(resident);
+
+    // Toda sessão operacional recebe um identificador comum. Cada assunto, porém,
+    // continua sendo uma OS própria com protocolo, categoria, prioridade e status independentes.
+    await ensureConversationId(sessionState, tickets);
+
+    const routing = await planTicketRouting({
+      message,
+      classification,
+      tickets,
+      activeTicketId: sessionState.activeTicketId,
+      history: contextHistory,
+    });
+
+    let ticket = null;
+    let isNewTopic = routing.action !== "CONTINUE";
+
+    if (routing.action === "CONTINUE" && routing.targetTicketId) {
+      const target = tickets.find((item) => item.id === routing.targetTicketId) || null;
+      if (target) {
+        await appendTicketMessage(target.id, "resident", message);
+        const mergedClassification = mergeClassificationForExistingTicket(target, classification);
+        ticket = await updateTicketClassification(target.id, mergedClassification);
+        classification = mergedClassification;
+
+        const index = tickets.findIndex((item) => item.id === target.id);
+        if (index >= 0) tickets[index] = ticket;
+        isNewTopic = false;
+      }
+    }
+
+    if (!ticket) {
       ticket = await createTicket({
         residentId: residentRecord.id,
         message,
@@ -366,26 +620,38 @@ app.post("/api/chat", async (req, res) => {
         source: "web",
         resident,
         ticketType,
+        conversationId: sessionState.conversationId,
       });
       await appendTicketMessage(ticket.id, "resident", message);
+      tickets.push(ticket);
+      sessionState.ticketIds = uniqueTicketIds([...sessionState.ticketIds, ticket.id]);
+      isNewTopic = hadExistingTickets;
     }
 
-    const operationalReply = buildOperationalReply(classification, ticket.protocol);
-    let reply = operationalReply;
+    sessionState.activeTicketId = ticket.id;
+    activeTicket = ticket;
 
+    const operationalReply = buildRoutedOperationalReply(
+      classification,
+      ticket,
+      isNewTopic,
+      hadExistingTickets
+    );
+
+    let reply = operationalReply;
     if (classification.intent === "CONSULTA_ATENDIMENTO") {
       reply = combineHybrid(knowledge?.answer, operationalReply);
-    } else if (classification.intent === "CONSULTA") {
-      reply = knowledge?.answer || operationalReply;
     }
 
     await appendTicketMessage(ticket.id, "assistant", reply);
 
-    const finalSessionToken = sessionToken || signSession(ticket);
+    const finalSessionToken = signSessionState(sessionState);
+    const protocols = sessionProtocols(tickets, sessionState.ticketIds);
 
-    return res.status(sessionToken ? 200 : 201).json({
+    return res.status(isNewTopic || !hadExistingTickets ? 201 : 200).json({
       success: true,
       protocol: ticket.protocol,
+      protocols,
       sessionToken: finalSessionToken,
       reply,
       intent: classification.intent,
@@ -397,6 +663,8 @@ app.post("/api/chat", async (req, res) => {
       grounded: Boolean(knowledge?.grounded),
       sources: knowledge?.sources || [],
       ticketType: ticket?.ticket_type || null,
+      newTicket: isNewTopic || !hadExistingTickets,
+      routingAction: routing.action,
     });
   } catch (error) {
     console.error("Erro no chat web:", {

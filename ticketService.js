@@ -53,7 +53,15 @@ async function createOrUpdateResident({ name, phone, unit, block = "", email = n
   return data;
 }
 
-async function createTicket({ residentId, message, classification, source, resident, ticketType = "REAL" }) {
+async function createTicket({
+  residentId,
+  message,
+  classification,
+  source,
+  resident,
+  ticketType = "REAL",
+  conversationId = null,
+}) {
   const protocol = generateProtocol();
 
   const description = [
@@ -81,6 +89,7 @@ async function createTicket({ residentId, message, classification, source, resid
       assigned_to: classification.responsible || ["Recepção"],
       source: source || "web",
       ticket_type: ticketType === "TESTE" ? "TESTE" : "REAL",
+      conversation_id: conversationId || null,
     })
     .select()
     .single();
@@ -143,6 +152,21 @@ async function updateTicketClassification(ticketId, classification) {
   return data;
 }
 
+async function ensureTicketConversationId(ticketId, conversationId) {
+  if (!ticketId || !conversationId) return null;
+
+  const { data, error } = await supabase
+    .from("tickets")
+    .update({ conversation_id: conversationId })
+    .eq("id", ticketId)
+    .is("conversation_id", null)
+    .select("id,conversation_id")
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
+}
+
 async function getConversationMessages(ticketId, limit = 14) {
   const { data, error } = await supabase
     .from("ticket_messages")
@@ -153,6 +177,35 @@ async function getConversationMessages(ticketId, limit = 14) {
 
   if (error) throw error;
   return (data || []).reverse();
+}
+
+async function getStaffReplies(ticketId, limit = 100) {
+  const { data, error } = await supabase
+    .from("ticket_messages")
+    .select("id,ticket_id,message,created_at")
+    .eq("ticket_id", ticketId)
+    .eq("sender", "staff")
+    .order("created_at", { ascending: true })
+    .limit(Math.min(Math.max(Number(limit) || 100, 1), 200));
+
+  if (error) throw error;
+  return data || [];
+}
+
+async function getStaffRepliesForTickets(ticketIds = [], limit = 200) {
+  const ids = [...new Set((ticketIds || []).filter(Boolean))].slice(-12);
+  if (!ids.length) return [];
+
+  const { data, error } = await supabase
+    .from("ticket_messages")
+    .select("id,ticket_id,message,created_at")
+    .in("ticket_id", ids)
+    .eq("sender", "staff")
+    .order("created_at", { ascending: true })
+    .limit(Math.min(Math.max(Number(limit) || 200, 1), 300));
+
+  if (error) throw error;
+  return data || [];
 }
 
 async function getTicketById(ticketId) {
@@ -166,12 +219,33 @@ async function getTicketById(ticketId) {
   return data;
 }
 
+async function getTicketsByIds(ticketIds = []) {
+  const ids = [...new Set((ticketIds || []).filter(Boolean))].slice(-12);
+  if (!ids.length) return [];
+
+  const { data, error } = await supabase
+    .from("tickets")
+    .select("*")
+    .in("id", ids);
+
+  if (error) throw error;
+
+  const order = new Map(ids.map((id, index) => [id, index]));
+  return (data || []).sort(
+    (a, b) => (order.get(a.id) ?? 999) - (order.get(b.id) ?? 999)
+  );
+}
+
 module.exports = {
   createOrUpdateResident,
   createTicket,
   appendTicketMessage,
   updateTicketClassification,
+  ensureTicketConversationId,
   getConversationMessages,
+  getStaffReplies,
+  getStaffRepliesForTickets,
   getTicketById,
+  getTicketsByIds,
   generateProtocol,
 };
