@@ -14,7 +14,7 @@ async function listTicketsForAdmin({ ticketType = "REAL", limit = 300 } = {}) {
   let query = supabase
     .from("tickets")
     .select(
-      "id,protocol,resident_id,category,priority,status,summary,emergency,requires_manager,requires_human,assigned_to,source,created_at,updated_at,ticket_type"
+      "id,protocol,resident_id,category,priority,status,summary,emergency,requires_manager,requires_human,assigned_to,source,created_at,updated_at,ticket_type,conversation_id"
     )
     .order("created_at", { ascending: false })
     .limit(Math.min(Math.max(Number(limit) || 300, 1), 500));
@@ -90,11 +90,33 @@ async function getTicketDetailForAdmin(ticketId) {
     console.warn("Não foi possível carregar histórico de status:", historyError.message);
   }
 
+  let relatedTickets = [];
+  if (ticket.conversation_id) {
+    const { data: related, error: relatedError } = await supabase
+      .from("tickets")
+      .select("id,protocol,category,priority,status,summary,ticket_type,created_at,conversation_id")
+      .eq("conversation_id", ticket.conversation_id)
+      .order("created_at", { ascending: true });
+
+    if (relatedError) {
+      console.warn("Não foi possível carregar protocolos relacionados:", relatedError.message);
+    } else {
+      const rows = related || [];
+      const originId = rows.length ? rows[0].id : null;
+      relatedTickets = rows.map((item) => ({
+        ...item,
+        is_origin: item.id === originId,
+        is_current: item.id === ticket.id,
+      }));
+    }
+  }
+
   return {
     ticket,
     resident,
     messages: messages || [],
     status_history: history || [],
+    related_tickets: relatedTickets,
   };
 }
 
