@@ -25,7 +25,7 @@ const {
 const { answerFromOfficialDocuments } = require("./knowledgeService");
 const { enforceNewConversationIntent, resolveTicketType } = require("./interactionPolicy");
 const { sendWhatsAppMessage } = require("./whatsappService");
-const { listTicketsForAdmin, getTicketDetailForAdmin, replyToTicketForAdmin } = require("./adminService");
+const { listTicketsForAdmin, getTicketDetailForAdmin, replyToTicketForAdmin, updateResidentPhoneForAdmin } = require("./adminService");
 const { sendWhatsAppReturnForAdmin } = require("./whatsappReturnService");
 const { planTicketRouting } = require("./ticketRouting");
 
@@ -443,6 +443,23 @@ app.post("/api/admin/tickets/:id/reply", requireAdmin, async (req, res) => {
   } catch (error) {
     console.error("Erro ao enviar retorno ao associado:", { message: error.message });
     return res.status(500).json({ error: "Não foi possível enviar o retorno ao associado." });
+  }
+});
+
+app.put("/api/admin/tickets/:id/contact", requireAdmin, async (req, res) => {
+  try {
+    const detail = await updateResidentPhoneForAdmin({
+      ticketId: req.params.id,
+      phone: req.body?.phone,
+      changedBy: "admin",
+    });
+
+    if (!detail) return res.status(404).json({ error: "OS não encontrada." });
+    return res.json({ success: true, ...detail });
+  } catch (error) {
+    console.error("Erro ao atualizar celular do associado:", { message: error.message });
+    const status = Number(error.statusCode) || 500;
+    return res.status(status).json({ error: error.message || "Não foi possível atualizar o celular." });
   }
 });
 

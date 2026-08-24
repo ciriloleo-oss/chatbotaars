@@ -1,6 +1,14 @@
 const { supabase } = require("./supabase");
 
 const CLOSED_STATUSES = new Set(["Resolvido", "Encerrado"]);
+const ALLOWED_STATUSES = new Set([
+  "Novo",
+  "Em atendimento",
+  "Aguardando associado",
+  "Resolvido",
+  "Encerrado",
+]);
+
 
 async function listTicketsForAdmin({ ticketType = "REAL", limit = 300 } = {}) {
   let query = supabase
@@ -90,7 +98,149 @@ async function getTicketDetailForAdmin(ticketId) {
   };
 }
 
+async function replyToTicketForAdmin({ ticketId, message, status = null, changedBy = "admin" }) {
+  const cleanMessage = String(message || "").trim().slice(0, 3000);
+  if (!cleanMessage) throw new Error("Digite uma mensagem para o associado.");
+
+  const { data: ticket, error: ticketError } = await supabase
+    .from("tickets")
+    .select("id,status,protocol")
+    .eq("id", ticketId)
+    .maybeSingle();
+
+  if (ticketError) throw ticketError;
+  if (!ticket) return null;
+
+  const { error: messageError } = await supabase.from("ticket_messages").insert({
+    ticket_id: ticketId,
+    sender: "staff",
+    message: cleanMessage,
+    message_type: "text",
+  });
+  if (messageError) throw messageError;
+
+  let targetStatus = ALLOWED_STATUSES.has(status) ? status : null;
+  if (!targetStatus && ticket.status === "Novo") targetStatus = "Em atendimento";
+
+  if (targetStatus && targetStatus !== ticket.status) {
+    const { error: updateError } = await supabase
+      .from("tickets")
+      .update({ status: targetStatus, updated_at: new Date().toISOString() })
+      .eq("id", ticketId);
+    if (updateError) throw updateError;
+
+    const { error: historyError } = await supabase.from("ticket_status_history").insert({
+      ticket_id: ticketId,
+      old_status: ticket.status,
+      new_status: targetStatus,
+      changed_by: changedBy,
+      note: "Status atualizado ao enviar retorno ao associado.",
+    });
+    if (historyError) {
+      console.warn("Não foi possível gravar histórico do retorno:", historyError.message);
+    }
+  }
+
+  return getTicketDetailForAdmin(ticketId);
+}
+
+function onlyDigits(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function normalizeBrazilPhone(value) {
+  let phone = onlyDigits(value).replace(/^0+/, "");
+  if (phone.length === 10 || phone.length === 11) phone = `55${phone}`;
+  if (!phone.startsWith("55")) return null;
+  return phone.length === 12 || phone.length === 13 ? phone : null;
+}
+
+function maskPhone(value) {
+  const digits = onlyDigits(value);
+  if (digits.length < 4) return "****";
+  return `••••${digits.slice(-4)}`;
+}
+
+async function updateResidentPhoneForAdmin({ ticketId, phone, changedBy = "admin" }) {
+  const normalized = normalizeBrazilPhone(phone);
+  if (!normalized) {
+    const error = new Error("Informe um celular válido com DDD.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const { data: ticket, error: ticketError } = await supabase
+    .from("tickets")
+    .select("id,protocol,resident_id,status")
+    .eq("id", ticketId)
+    .maybeSingle();
+
+  if (ticketError) throw ticketError;
+  if (!ticket) return null;
+  if (!ticket.resident_id) {
+    const error = new Error("Esta OS não possui associado vinculado.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const { data: resident, error: residentError } = await supabase
+    .from("residents")
+    .select("id,name,phone")
+    .eq("id", ticket.resident_id)
+    .maybeSingle();
+
+  if (residentError) throw residentError;
+  if (!resident) {
+    const error = new Error("Cadastro do associado não encontrado.");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const { data: duplicate, error: duplicateError } = await supabase
+    .from("residents")
+    .select("id,name,unit")
+    .eq("phone", normalized)
+    .neq("id", resident.id)
+    .limit(1)
+    .maybeSingle();
+
+  if (duplicateError) throw duplicateError;
+  if (duplicate) {
+    const error = new Error("Este celular já está vinculado a outro cadastro.");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const previousPhone = resident.phone || "";
+  const { error: updateError } = await supabase
+    .from("residents")
+    .update({ phone: normalized })
+    .eq("id", resident.id);
+
+  if (updateError) throw updateError;
+
+  if (onlyDigits(previousPhone) !== normalized) {
+    const { error: historyError } = await supabase
+      .from("ticket_status_history")
+      .insert({
+        ticket_id: ticket.id,
+        old_status: ticket.status || "Novo",
+        new_status: ticket.status || "Novo",
+        changed_by: changedBy,
+        note: `Celular do associado atualizado no painel: ${maskPhone(previousPhone)} → ${maskPhone(normalized)}.`,
+      });
+
+    if (historyError) {
+      console.warn("Não foi possível gravar histórico da alteração de celular:", historyError.message);
+    }
+  }
+
+  return getTicketDetailForAdmin(ticketId);
+}
+
 module.exports = {
   listTicketsForAdmin,
   getTicketDetailForAdmin,
+  replyToTicketForAdmin,
+  updateResidentPhoneForAdmin,
 };
