@@ -155,44 +155,16 @@ async function sendWhatsAppReturnForAdmin(ticketId, message) {
 
   const evolutionUrl = `${baseUrl}/message/sendText/${encodeURIComponent(instance)}`;
 
-  // Evolution API v2.2.x / Baileys: algumas builds esperam o formato
-  // legado documentado com options + textMessage. O payload flat
-  // { number, text, delay } pode retornar 500 tentando ler textMessage.
-  const legacyPayload = {
+  // Esta instalação da Evolution valida o campo `text` no topo do payload.
+  // O formato com `textMessage` retorna HTTP 400: instance requires property "text".
+  const payload = {
     number: phone,
-    options: {
-      delay: 1200,
-      presence: "composing",
-    },
-    textMessage: {
-      text,
-    },
+    text,
+    delay: 1200,
+    linkPreview: false,
   };
 
-  let result = await callEvolution({ evolutionUrl, apiKey, payload: legacyPayload });
-
-  // Compatibilidade com builds mais novas que validam "text" no topo.
-  // Só fazemos fallback em 400/422 (erro de validação, antes do envio),
-  // evitando risco de duplicidade após um eventual 500 do provedor.
-  if (!result.response.ok && [400, 422].includes(result.response.status)) {
-    const providerMsg = getEvolutionErrorMessage(result.responseJson, result.responseText).toLowerCase();
-    const looksLikeNewSchema =
-      providerMsg.includes('property "text"') ||
-      providerMsg.includes("property 'text'") ||
-      providerMsg.includes("text is required") ||
-      providerMsg.includes("textmessage is not allowed") ||
-      providerMsg.includes("textmessage must not exist");
-
-    if (looksLikeNewSchema) {
-      const flatPayload = {
-        number: phone,
-        text,
-        delay: 1200,
-        linkPreview: false,
-      };
-      result = await callEvolution({ evolutionUrl, apiKey, payload: flatPayload });
-    }
-  }
+  const result = await callEvolution({ evolutionUrl, apiKey, payload });
 
   if (!result.response.ok) {
     const providerMessage = getEvolutionErrorMessage(result.responseJson, result.responseText);
