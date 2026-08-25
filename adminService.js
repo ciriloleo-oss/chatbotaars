@@ -1,3 +1,4 @@
+const { getEmergencyDispatchesForTicket } = require("./emergencyService");
 const { supabase } = require("./supabase");
 
 const CLOSED_STATUSES = new Set(["Resolvido", "Encerrado"]);
@@ -111,12 +112,20 @@ async function getTicketDetailForAdmin(ticketId) {
     }
   }
 
+  let emergencyDispatches = [];
+  try {
+    emergencyDispatches = await getEmergencyDispatchesForTicket(ticketId);
+  } catch (dispatchError) {
+    console.warn("Não foi possível carregar os disparos de emergência:", dispatchError.message);
+  }
+
   return {
     ticket,
     resident,
     messages: messages || [],
     status_history: history || [],
     related_tickets: relatedTickets,
+    emergency_dispatches: emergencyDispatches,
   };
 }
 

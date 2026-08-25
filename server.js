@@ -27,6 +27,12 @@ const { enforceNewConversationIntent, resolveTicketType } = require("./interacti
 const { sendWhatsAppMessage } = require("./whatsappService");
 const { listTicketsForAdmin, getTicketDetailForAdmin, replyToTicketForAdmin, updateResidentPhoneForAdmin } = require("./adminService");
 const { sendWhatsAppReturnForAdmin } = require("./whatsappReturnService");
+const {
+  listEmergencyRecipients,
+  saveEmergencyRecipient,
+  dispatchEmergencyMessage,
+  sendEmergencyTest,
+} = require("./emergencyService");
 const { planTicketRouting } = require("./ticketRouting");
 
 const app = express();
@@ -474,6 +480,61 @@ app.post("/api/admin/tickets/:id/whatsapp", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/api/admin/emergency/recipients", requireAdmin, async (req, res) => {
+  try {
+    const recipients = await listEmergencyRecipients({ includeInactive: true });
+    return res.json({ success: true, recipients });
+  } catch (error) {
+    console.error("Erro ao listar contatos de emergência:", { message: error.message });
+    return res.status(500).json({ error: "Não foi possível carregar os contatos de emergência." });
+  }
+});
+
+app.post("/api/admin/emergency/recipients", requireAdmin, async (req, res) => {
+  try {
+    const recipient = await saveEmergencyRecipient({
+      name: req.body?.name,
+      role: req.body?.role,
+      phone: req.body?.phone,
+      active: req.body?.active !== false,
+      receiveTestAlerts: Boolean(req.body?.receive_test_alerts),
+      sortOrder: req.body?.sort_order,
+    });
+    return res.status(201).json({ success: true, recipient });
+  } catch (error) {
+    const status = Number(error.statusCode) || 500;
+    return res.status(status).json({ error: error.message || "Não foi possível salvar o contato." });
+  }
+});
+
+app.put("/api/admin/emergency/recipients/:id", requireAdmin, async (req, res) => {
+  try {
+    const recipient = await saveEmergencyRecipient({
+      id: req.params.id,
+      name: req.body?.name,
+      role: req.body?.role,
+      phone: req.body?.phone,
+      active: req.body?.active !== false,
+      receiveTestAlerts: Boolean(req.body?.receive_test_alerts),
+      sortOrder: req.body?.sort_order,
+    });
+    return res.json({ success: true, recipient });
+  } catch (error) {
+    const status = Number(error.statusCode) || 500;
+    return res.status(status).json({ error: error.message || "Não foi possível atualizar o contato." });
+  }
+});
+
+app.post("/api/admin/emergency/recipients/:id/test", requireAdmin, async (req, res) => {
+  try {
+    const dispatch = await sendEmergencyTest(req.params.id);
+    return res.json({ success: true, dispatch });
+  } catch (error) {
+    const status = Number(error.statusCode) || 500;
+    return res.status(status).json({ error: error.message || "Não foi possível enviar o teste." });
+  }
+});
+
 app.get("/api/chat/replies", async (req, res) => {
   try {
     const auth = String(req.headers.authorization || "");
@@ -552,6 +613,11 @@ app.post("/api/chat", async (req, res) => {
     // A trava documental agora vale também quando já existe uma OS na sessão.
     // Assim, uma pergunta sobre RI/Estatuto não contamina a solicitação operacional ativa.
     classification = enforceNewConversationIntent(classification, message);
+    const messageWasEmergency = Boolean(classification.emergency);
+    // Segurança: se a própria classificação marcou emergência, nunca tratamos como mera consulta/conversa.
+    if (messageWasEmergency && ["CONSULTA", "CONVERSA"].includes(classification.intent)) {
+      classification.intent = "ATENDIMENTO";
+    }
 
     const currentSessionToken = () =>
       sessionState.ticketIds.length ? signSessionState(sessionState) : null;
@@ -613,12 +679,13 @@ app.post("/api/chat", async (req, res) => {
     });
 
     let ticket = null;
+    let residentMessageRow = null;
     let isNewTopic = routing.action !== "CONTINUE";
 
     if (routing.action === "CONTINUE" && routing.targetTicketId) {
       const target = tickets.find((item) => item.id === routing.targetTicketId) || null;
       if (target) {
-        await appendTicketMessage(target.id, "resident", message);
+        residentMessageRow = await appendTicketMessage(target.id, "resident", message);
         const mergedClassification = mergeClassificationForExistingTicket(target, classification);
         ticket = await updateTicketClassification(target.id, mergedClassification);
         classification = mergedClassification;
@@ -639,7 +706,7 @@ app.post("/api/chat", async (req, res) => {
         ticketType,
         conversationId: sessionState.conversationId,
       });
-      await appendTicketMessage(ticket.id, "resident", message);
+      residentMessageRow = await appendTicketMessage(ticket.id, "resident", message);
       tickets.push(ticket);
       sessionState.ticketIds = uniqueTicketIds([...sessionState.ticketIds, ticket.id]);
       isNewTopic = hadExistingTickets;
@@ -647,6 +714,25 @@ app.post("/api/chat", async (req, res) => {
 
     sessionState.activeTicketId = ticket.id;
     activeTicket = ticket;
+
+    // Emergência não espera o fim da conversa: dispara assim que a mensagem é registrada.
+    // Falhas no WhatsApp não bloqueiam a criação/continuidade da OS.
+    if (messageWasEmergency && residentMessageRow?.id) {
+      try {
+        await dispatchEmergencyMessage({
+          ticketId: ticket.id,
+          ticketMessageId: residentMessageRow.id,
+          message,
+          dispatchType: isNewTopic || !hadExistingTickets ? "ALERT" : "UPDATE",
+        });
+      } catch (error) {
+        // A OS nunca deixa de ser criada por falha do provedor de WhatsApp.
+        console.error("Falha no despacho automático de emergência:", {
+          protocol: ticket.protocol,
+          message: error.message,
+        });
+      }
+    }
 
     const operationalReply = buildRoutedOperationalReply(
       classification,
@@ -742,6 +828,9 @@ app.post("/webhook", async (req, res) => {
     const resident = { name: "Associado", phone, unit: "Não informada", block: "" };
     let classification = await classifyInteraction(text, [], resident);
     classification = enforceNewConversationIntent(classification, text);
+    if (classification.emergency && ["CONSULTA", "CONVERSA"].includes(classification.intent)) {
+      classification.intent = "ATENDIMENTO";
+    }
 
     if (classification.intent === "CONSULTA") {
       const knowledge = await answerFromOfficialDocuments({
@@ -763,7 +852,23 @@ app.post("/webhook", async (req, res) => {
       resident,
       ticketType,
     });
-    await appendTicketMessage(ticket.id, "resident", text, whatsappMessage.id);
+    const inboundMessageRow = await appendTicketMessage(ticket.id, "resident", text, whatsappMessage.id);
+
+    if (classification.emergency && inboundMessageRow?.id) {
+      try {
+        await dispatchEmergencyMessage({
+          ticketId: ticket.id,
+          ticketMessageId: inboundMessageRow.id,
+          message: text,
+          dispatchType: "ALERT",
+        });
+      } catch (dispatchError) {
+        console.error("Falha no despacho automático de emergência do webhook:", {
+          protocol: ticket.protocol,
+          message: dispatchError.message,
+        });
+      }
+    }
 
     let reply = buildOperationalReply(classification, ticket.protocol);
     if (classification.intent === "CONSULTA_ATENDIMENTO") {
