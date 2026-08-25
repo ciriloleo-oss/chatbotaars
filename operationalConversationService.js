@@ -17,12 +17,12 @@ function normalize(value = "") {
 }
 
 function normalizeHistory(history = []) {
-  return (Array.isArray(history) ? history : []).slice(-12).map((item) => ({
+  return (Array.isArray(history) ? history : []).slice(-14).map((item) => ({
     role:
       item.role === "assistant" || item.sender === "assistant"
         ? "assistant"
         : "user",
-    text: String(item.text || item.message || "").slice(0, 900),
+    text: String(item.text || item.message || "").slice(0, 1000),
   }));
 }
 
@@ -79,6 +79,82 @@ function lastAssistantQuestion(history = []) {
   return null;
 }
 
+function recentAssistantQuestionCount(history = []) {
+  const items = normalizeHistory(history);
+  let count = 0;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item.role === "assistant" && item.text.includes("?")) count += 1;
+    if (count >= 3) break;
+  }
+  return count;
+}
+
+function isCftvCoverageCase(message, history = [], ticket = null) {
+  const text = normalize([
+    ticket?.summary || "",
+    ticket?.description || "",
+    ...(normalizeHistory(history).map((x) => x.text)),
+    message || "",
+  ].join(" "));
+  const camera = /\b(camera|cameras|cftv|filmagem|campo de visao|campo de visão|ponto cego|cobertura)\b/.test(text);
+  const coverage = /\b(final da rua|fim da rua|apontad|sentido contrario|sentido contrário|nao pega|não pega|fora do campo|cobertura parcial|cobertura total|ultimas casas|últimas casas|residencia|residência|vizinhos)\b/.test(text);
+  return camera && coverage;
+}
+
+function hasCftvPositionDetail(message, history = []) {
+  const text = normalize([
+    ...(normalizeHistory(history).filter((x) => x.role === "user").map((x) => x.text)),
+    message || "",
+  ].join(" "));
+  return /\b(aponta|apontada|apontado|sentido contrario|sentido contrário|antes da minha|antes da residencia|antes da residência|fora do campo|nao pega minha|não pega minha|nao pega as|não pega as|cobertura parcial|cobertura total|pega so|pega só|ultimas casas|últimas casas)\b/.test(text);
+}
+
+function neutralCftvSummary(resident = {}) {
+  const unit = cleanText(resident?.unit, 80);
+  const where = unit ? ` na região da unidade ${unit}` : " no local informado";
+  return `Avaliar a cobertura de CFTV${where}, verificando o campo de visão da câmera existente, possíveis pontos cegos e eventual necessidade de ajuste ou ampliação após análise técnica.`;
+}
+
+function applyDeterministicQualityGuards(result, { message, history = [], ticket = null, resident = {} }) {
+  const guarded = { ...result };
+
+  // Caso de regressão importante: dúvidas sobre cobertura de CFTV não devem encerrar
+  // antes de sabermos se existe cobertura total, parcial ou ausência de campo de visão.
+  // Também não devemos prescrever instalação/realocação antes da análise técnica.
+  if (isCftvCoverageCase(message, history, ticket)) {
+    guarded.mode = "OPERATIONAL";
+    guarded.actionableSummary = neutralCftvSummary(resident);
+
+    const hasPosition = hasCftvPositionDetail(message, history);
+    const questionsAlreadyAsked = recentAssistantQuestionCount(history);
+
+    if (!hasPosition && questionsAlreadyAsked < 2) {
+      guarded.intakeComplete = false;
+      guarded.nextQuestion = "A câmera atual deixa sua residência e as últimas casas totalmente fora do campo de visão ou existe alguma cobertura parcial?";
+    } else {
+      guarded.intakeComplete = true;
+      guarded.nextQuestion = null;
+      if (ticket && lastAssistantQuestion(history)) guarded.relation = "DETAIL";
+    }
+
+    const asksCauseNow = /\b(por que|porque|qual motivo|motivo)\b/.test(normalize(message));
+    if (asksCauseNow && !guarded.responseNote) {
+      guarded.responseNote = "Não tenho informações técnicas suficientes para afirmar por que a configuração atual das câmeras foi adotada.";
+    } else if (!asksCauseNow) {
+      guarded.responseNote = null;
+    }
+  }
+
+  // Uma OS já existente nunca volta a perguntar se o usuário quer registrá-la.
+  if (ticket?.protocol && guarded.nextQuestion && /\b(registrar|abrir (um )?registro|abrir (uma )?solicitacao|abrir (uma )?solicitação)\b/i.test(guarded.nextQuestion)) {
+    guarded.nextQuestion = null;
+    guarded.intakeComplete = true;
+  }
+
+  return guarded;
+}
+
 function fallbackAnalysis({ message, history = [], ticket = null, classification = {}, resident = {} }) {
   const text = normalize(message);
   const lastQuestion = lastAssistantQuestion(history);
@@ -101,7 +177,7 @@ function fallbackAnalysis({ message, history = [], ticket = null, classification
       ? ticket?.summary || classification.summary || message
       : classification.summary || ticket?.summary || message;
 
-  return {
+  return applyDeterministicQualityGuards({
     mode: documentary ? "DOCUMENTARY" : "OPERATIONAL",
     relation,
     sameSubject: relation !== "NEW_OCCURRENCE",
@@ -111,7 +187,7 @@ function fallbackAnalysis({ message, history = [], ticket = null, classification
     actionableSummary: cleanText(fallbackSummary, 500),
     responseNote: null,
     reason: "fallback local",
-  };
+  }, { message, history, ticket, resident });
 }
 
 async function analyzeOperationalConversation({
@@ -128,22 +204,32 @@ async function analyzeOperationalConversation({
 
   const prompt = `
 Você controla a QUALIDADE DA CONVERSA de um atendimento operacional da AARS.
-Seu objetivo é evitar interrogatórios desnecessários e produzir uma OS clara e acionável.
+Seu objetivo é obter a MENOR quantidade de informação que permita uma primeira ação útil da equipe, sem encerrar cedo demais e sem transformar a conversa em interrogatório.
 
 PRINCÍPIOS OBRIGATÓRIOS:
 1. Uma OS existente JÁ É UM REGISTRO. Nunca sugira "posso registrar?", "gostaria que registrasse?" ou equivalente se ticket.protocol existir.
 2. Diferencie o ASSUNTO PRINCIPAL de exemplos, hipóteses e casos passados usados apenas para explicar uma preocupação.
 3. Marcadores como "por exemplo", "foi só um exemplo", "caso aconteça", "como já aconteceu em outras casas" normalmente NÃO criam nova ocorrência.
 4. Se um fato passado pode ser tanto uma ocorrência separada quanto apenas um exemplo e o usuário não deixou claro, use AMBIGUOUS_EXAMPLE e pergunte UMA ÚNICA vez se ele quer registrá-lo separadamente.
-   Exemplo: se o assunto principal é cobertura de câmeras e o associado cita uma bola levada da garagem apenas para ilustrar o risco, não transforme isso automaticamente em uma investigação de furto.
-5. Se o usuário corrige uma interpretação (ex.: "não é pelos fundos, é pela frente"), trate como CORRECTION, atualize o entendimento e não reinicie a coleta.
+5. Se o usuário corrige uma interpretação, trate como CORRECTION, atualize o entendimento e não reinicie a coleta.
 6. Faça no máximo UMA pergunta por resposta.
-7. Pare de perguntar assim que houver informação suficiente para a equipe agir.
-8. Considere suficiente quando houver: problema/objetivo operacional claro + local ou referência razoável + providência pretendida ou avaliação esperada. A unidade do associado pode servir como referência de local quando fizer sentido.
-9. Não investigue data, horário, autor ou detalhes de um fato antigo se ele foi mencionado apenas como exemplo.
-10. Perguntas técnicas operacionais como "por que a câmera está assim?" ou "como a segurança vai identificar?" NÃO são automaticamente perguntas documentais. Use DOCUMENTARY apenas quando a resposta depende de Estatuto, RI, regra, horário, capacidade, permissão, penalidade ou norma oficial.
-11. Nunca invente critérios técnicos, políticas, decisões ou fatos que não estejam no histórico.
-12. O resumo deve ser curto, técnico e orientado à ação, descrevendo o que a equipe precisa avaliar/fazer. Evite frases vagas como "solicitação conforme informado".
+7. Use o critério VALOR DA INFORMAÇÃO: só pergunte algo se a resposta puder mudar materialmente a primeira ação, prioridade, local de atuação ou tipo de avaliação da equipe.
+8. Pare de perguntar quando já houver: problema/objetivo claro + referência de local suficiente + contexto mínimo para a equipe iniciar a avaliação.
+9. A unidade do associado pode servir como referência de local quando fizer sentido. Não peça endereço completo se a unidade já resolve a localização inicial.
+10. NÃO encerre cedo demais. Se ainda faltar UMA informação curta que muda de forma importante a avaliação técnica, faça essa pergunta e então encerre após a resposta.
+11. Não investigue data, horário, autor ou detalhes de um fato antigo se ele foi mencionado apenas como exemplo.
+12. Perguntas técnico-operacionais como "por que a câmera está assim?" ou "como a segurança vai identificar?" NÃO são automaticamente documentais.
+13. Nunca invente critérios técnicos, políticas, decisões ou fatos que não estejam no histórico.
+14. O resumo deve ser curto, técnico, NEUTRO e orientado à ação. Descreva a condição observada e o que deve ser AVALIADO.
+15. Não prescreva solução antes da análise técnica. Ex.: não determine "instalar câmera" ou "realocar câmera" se o associado apenas relatou falta de cobertura. Prefira "avaliar cobertura, campo de visão, pontos cegos e eventual necessidade de ajuste ou ampliação".
+16. Se o usuário perguntou a CAUSA de uma configuração técnica e não há dados para explicá-la, use response_note curto e transparente, sem inventar justificativa.
+17. Evite repetir avisos documentais e frases burocráticas. A conversa deve soar natural, objetiva e profissional.
+
+REGRA ESPECIAL DE COBERTURA / CFTV:
+Se o associado questiona falta de câmera, posição, sentido ou cobertura de CFTV, uma informação costuma ter alto valor: se a câmera existente deixa o local totalmente fora do campo de visão ou se existe cobertura parcial.
+- Se isso ainda NÃO estiver claro, faça UMA pergunta sobre cobertura total/parcial/campo de visão.
+- Se o associado já explicou a posição/sentido da câmera e o ponto cego, considere a coleta suficiente e encerre.
+- O resumo nunca deve assumir que a solução será instalar ou realocar câmera antes da análise técnica.
 
 MODOS:
 - OPERATIONAL: assunto técnico/operacional; não precisa consultar documentos oficiais.
@@ -205,14 +291,24 @@ Retorne SOMENTE JSON válido:
   "intake_complete": true,
   "needs_separate_occurrence_clarification": false,
   "next_question": null,
-  "actionable_summary": "resumo técnico e acionável da OS",
+  "actionable_summary": "resumo técnico, neutro e acionável da OS",
   "response_note": null,
   "reason": "explicação curta"
 }
 
+Regras para next_question:
+- Deve ser uma única pergunta curta.
+- Só faça se a resposta tiver valor operacional real.
+- Não pergunte algo já respondido no histórico.
+
+Regras para actionable_summary:
+- Registre o PROBLEMA/CONDIÇÃO e a AVALIAÇÃO esperada.
+- Não transforme uma hipótese de solução em decisão já tomada.
+- Evite termos emocionais/vagos como "preocupação contínua" quando há uma demanda técnica concreta.
+
 Regras para response_note:
 - Use somente se o usuário fez uma pergunta operacional direta cuja causa/critério não pode ser afirmada com os dados disponíveis.
-- Nesse caso escreva uma frase curta como: "Não tenho informações técnicas suficientes para afirmar por que essa configuração foi adotada."
+- Ex.: "Não tenho informações técnicas suficientes para afirmar por que essa configuração foi adotada."
 - Nunca invente a resposta.
 `;
 
@@ -242,7 +338,7 @@ Regras para response_note:
       nextQuestion = "Esse fato que você mencionou foi apenas um exemplo da sua preocupação ou você quer registrá-lo como uma ocorrência separada?";
     }
 
-    return {
+    const result = {
       mode,
       relation,
       sameSubject,
@@ -253,6 +349,8 @@ Regras para response_note:
       responseNote: cleanText(data.response_note, 320),
       reason: cleanText(data.reason, 300) || "análise operacional",
     };
+
+    return applyDeterministicQualityGuards(result, { message, history, ticket, resident });
   } catch (error) {
     console.warn("Falha na politica de conversa operacional:", { message: error.message, status: error.status });
     return fallbackAnalysis({ message, history, ticket, classification, resident });
@@ -290,16 +388,37 @@ function buildOperationalPolicyReply({ policy, ticket, isNewTopic = false, hadEx
     return parts.filter(Boolean).join("\n\n");
   }
 
-  if (policy.intakeComplete || !policy.nextQuestion) {
-    const summary = policy.actionableSummary || ticket.summary || "a solicitacao informada";
-    parts.push(`Entendi. O protocolo ${protocol} está registrado com o seguinte encaminhamento: ${summary}`);
-    parts.push("A equipe responsável fará a análise e o encaminhamento adequado. Se surgir uma informação nova e relevante sobre este mesmo assunto, pode enviá-la por aqui.");
+  const summary = policy.actionableSummary || ticket.summary || "a solicitação informada";
+  const relation = policy.relation || "DIRECT";
+
+  if (!policy.intakeComplete && policy.nextQuestion) {
+    if (!hadExistingTickets) {
+      parts.push(`Registrei o protocolo ${protocol} para ${lowercaseFirst(summary)}`);
+    } else if (["DETAIL", "CORRECTION"].includes(relation)) {
+      parts.push(`Atualizei o protocolo ${protocol} com essa informação.`);
+    } else {
+      parts.push(`O protocolo ${protocol} segue registrado para ${lowercaseFirst(summary)}`);
+    }
+    parts.push(`Para complementar a avaliação: ${policy.nextQuestion}`);
     return parts.filter(Boolean).join("\n\n");
   }
 
-  parts.push(`O protocolo ${protocol} já está registrado.`);
-  parts.push(policy.nextQuestion);
+  if (["DETAIL", "CORRECTION"].includes(relation) && hadExistingTickets) {
+    parts.push(`Perfeito. Acrescentei essa informação ao protocolo ${protocol}.`);
+  } else if (!hadExistingTickets) {
+    parts.push(`Registrei o protocolo ${protocol} para ${lowercaseFirst(summary)}`);
+  } else {
+    parts.push(`O protocolo ${protocol} está atualizado para ${lowercaseFirst(summary)}`);
+  }
+
+  parts.push("A solicitação está completa para a primeira análise da equipe responsável.");
   return parts.filter(Boolean).join("\n\n");
+}
+
+function lowercaseFirst(text) {
+  const value = String(text || "").trim();
+  if (!value) return value;
+  return value.charAt(0).toLowerCase() + value.slice(1);
 }
 
 module.exports = {
