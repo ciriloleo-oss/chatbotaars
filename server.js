@@ -41,6 +41,12 @@ const {
   buildEmergencyResidentReply,
 } = require("./emergencyTriageService");
 const { planTicketRouting } = require("./ticketRouting");
+const {
+  analyzeOperationalConversation,
+  shouldForceContinuation,
+  shouldUseOfficialDocuments,
+  buildOperationalPolicyReply,
+} = require("./operationalConversationService");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -640,11 +646,71 @@ app.post("/api/chat", async (req, res) => {
 
     // A trava documental agora vale também quando já existe uma OS na sessão.
     // Assim, uma pergunta sobre RI/Estatuto não contamina a solicitação operacional ativa.
+    const forcedEmergencyFollowup = Boolean(
+      activeEmergencyInTriage && emergencyTriageAnalysis?.relevant
+    );
+
     classification = enforceNewConversationIntent(classification, message);
+
+    // A política documental/conversacional não pode desmontar uma triagem de emergência ativa.
+    // Ex.: após perguntarmos o local, respostas curtas como "adm", "lago" ou "QH 12"
+    // precisam permanecer na mesma OS mesmo que o classificador geral as interprete como conversa.
+    if (forcedEmergencyFollowup) {
+      classification.emergency = true;
+      classification.intent = "ATENDIMENTO";
+      classification.priority = "CRITICA";
+    }
+
     const messageWasEmergency = Boolean(classification.emergency);
     // Segurança: se a própria classificação marcou emergência, nunca tratamos como mera consulta/conversa.
     if (messageWasEmergency && ["CONSULTA", "CONVERSA"].includes(classification.intent)) {
       classification.intent = "ATENDIMENTO";
+    }
+
+    // Política de qualidade da conversa operacional. Ela separa exemplo/hipótese de
+    // ocorrência real, reconhece correções e impede que uma OS já aberta volte a
+    // perguntar se o associado deseja registrá-la. Também decide quando a coleta
+    // já possui informação suficiente para encerrar sem interrogatório.
+    let operationalPolicy = null;
+    if (!messageWasEmergency && !activeEmergencyInTriage && (
+      activeTicket ||
+      classification.intent === "ATENDIMENTO" ||
+      classification.intent === "CONSULTA_ATENDIMENTO"
+    )) {
+      operationalPolicy = await analyzeOperationalConversation({
+        message,
+        history: contextHistory,
+        ticket: activeTicket,
+        tickets,
+        classification,
+        resident,
+      });
+
+      if (operationalPolicy?.actionableSummary) {
+        classification.summary = operationalPolicy.actionableSummary;
+      }
+      if (typeof operationalPolicy?.intakeComplete === "boolean") {
+        classification.intake_complete = operationalPolicy.intakeComplete;
+      }
+      if (operationalPolicy?.nextQuestion) {
+        classification.next_question = operationalPolicy.nextQuestion;
+      }
+
+      // Uma resposta curta a uma pergunta de coleta (ou uma correção/exemplo) não
+      // pode cair no cumprimento padrão nem abrir uma nova OS.
+      if (shouldForceContinuation(operationalPolicy, activeTicket)) {
+        classification.intent = "ATENDIMENTO";
+      }
+
+      // Perguntas técnico-operacionais não devem consultar RI/Estatuto só porque
+      // estão formuladas como pergunta. Isso elimina o fallback documental repetido.
+      if (operationalPolicy.mode === "OPERATIONAL" && classification.intent === "CONSULTA_ATENDIMENTO") {
+        classification.intent = "ATENDIMENTO";
+      } else if (operationalPolicy.mode === "DOCUMENTARY" && classification.intent === "ATENDIMENTO" && !activeTicket) {
+        classification.intent = "CONSULTA";
+      } else if (operationalPolicy.mode === "MIXED" && classification.intent === "ATENDIMENTO") {
+        classification.intent = "CONSULTA_ATENDIMENTO";
+      }
     }
 
     const currentSessionToken = () =>
@@ -663,10 +729,7 @@ app.post("/api/chat", async (req, res) => {
     }
 
     let knowledge = null;
-    if (
-      classification.intent === "CONSULTA" ||
-      classification.intent === "CONSULTA_ATENDIMENTO"
-    ) {
+    if (shouldUseOfficialDocuments(classification, operationalPolicy)) {
       knowledge = await answerFromOfficialDocuments({
         question: message,
         history: contextHistory,
@@ -700,13 +763,15 @@ app.post("/api/chat", async (req, res) => {
 
     const routing = activeEmergencyInTriage && emergencyTriageAnalysis?.relevant && activeTicket
       ? { action: "CONTINUE", targetTicketId: activeTicket.id, reason: "complemento da triagem de emergencia ativa" }
-      : await planTicketRouting({
-          message,
-          classification,
-          tickets,
-          activeTicketId: sessionState.activeTicketId,
-          history: contextHistory,
-        });
+      : shouldForceContinuation(operationalPolicy, activeTicket)
+        ? { action: "CONTINUE", targetTicketId: activeTicket.id, reason: `continuidade operacional: ${operationalPolicy.relation}` }
+        : await planTicketRouting({
+            message,
+            classification,
+            tickets,
+            activeTicketId: sessionState.activeTicketId,
+            history: contextHistory,
+          });
 
     let ticket = null;
     let residentMessageRow = null;
@@ -800,15 +865,21 @@ app.post("/api/chat", async (req, res) => {
         question: triageQuestion,
       });
     } else {
-      const operationalReply = buildRoutedOperationalReply(
+      const policyReply = buildOperationalPolicyReply({
+        policy: operationalPolicy,
+        ticket,
+        isNewTopic,
+        hadExistingTickets,
+      });
+      const operationalReply = policyReply || buildRoutedOperationalReply(
         classification,
         ticket,
         isNewTopic,
         hadExistingTickets
       );
       reply = operationalReply;
-      if (classification.intent === "CONSULTA_ATENDIMENTO") {
-        reply = combineHybrid(knowledge?.answer, operationalReply);
+      if (classification.intent === "CONSULTA_ATENDIMENTO" && knowledge?.answer) {
+        reply = combineHybrid(knowledge.answer, operationalReply);
       }
     }
 

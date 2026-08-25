@@ -35,6 +35,103 @@ function normalizeHistory(history = []) {
   }));
 }
 
+
+function normalizeLoose(value) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " " );
+}
+
+function inferEmergencyTypeFromText(value) {
+  const text = normalizeLoose(value);
+  if (!text) return null;
+  if (/\b(fogo|incendio|incendiando|fumaca|chamas?)\b/.test(text)) return "INCENDIO";
+  if (/\b(invasao|invadindo|invadir|arrombamento|arrombando)\b/.test(text)) return "INVASAO";
+  if (/\b(agressao|agredindo|ameaca|ameacando|briga)\b/.test(text)) return "AGRESSAO_AMEACA";
+  if (/\b(acidente|atropelamento|colisao|batida|capotamento)\b/.test(text)) return "ACIDENTE";
+  if (/\b(desmaiou|desmaio|convulsao|infarto|parada cardiaca|emergencia medica|passando mal)\b/.test(text)) return "EMERGENCIA_MEDICA";
+  if (/\b(pessoa suspeita|suspeito|suspeita)\b/.test(text)) return "PESSOA_SUSPEITA";
+  if (/\b(furto|roubo|assalto|furtando|roubando)\b/.test(text)) return "FURTO_ROUBO";
+  if (/\b(vazamento de gas|cheiro de gas|curto circuito|choque eletrico|fio energizado|rede eletrica)\b/.test(text)) return "GAS_ELETRICA";
+  return null;
+}
+
+function lastAssistantText(history = []) {
+  const items = normalizeHistory(history);
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (items[i].role === "assistant" && items[i].text) return items[i].text;
+  }
+  return "";
+}
+
+function expectedFieldFromHistory(history = []) {
+  const text = normalizeLoose(lastAssistantText(history));
+  if (!text) return null;
+  if (text.includes("onde exatamente isso esta acontecendo")) return "location";
+  if (text.includes("a situacao ainda esta acontecendo")) return "ongoing";
+  if (text.includes("ha alguem em risco ou ferido")) return "risk_injuries";
+  if (text.includes("descrever a pessoa ou veiculo")) return "person_vehicle_description";
+  if (text.includes("arma visivel")) return "weapon_visible";
+  if (text.includes("gas, rede eletrica") || text.includes("possibilidade de o fogo se espalhar")) return "specific_risk";
+  if (text.includes("quantas pessoas estao envolvidas")) return "details";
+  return null;
+}
+
+function parseYesNo(value) {
+  const text = normalizeLoose(value).replace(/[.!?]+$/g, "");
+  if (/^(sim|s|ss|isso|esta|continua|ainda esta|positivo)$/.test(text)) return true;
+  if (/^(nao|n|nn|negativo|nao esta|parou|acabou|cessou)$/.test(text)) return false;
+  return null;
+}
+
+function looksLikeClearTopicChange(value) {
+  const text = normalizeLoose(value);
+  if (!text) return true;
+  if (/^(oi|ola|bom dia|boa tarde|boa noite|obrigado|obrigada|valeu|tchau)$/.test(text)) return true;
+  if (/[?]/.test(String(value || "")) && /\b(estatuto|regulamento|horario|academia|quadra|assembleia|boleto|financeiro)\b/.test(text)) return true;
+  return false;
+}
+
+function deterministicFollowup({ message, history = [], previousTriage = {} }) {
+  const expected = expectedFieldFromHistory(history);
+  const raw = cleanText(message, 600);
+  if (!expected || !raw || looksLikeClearTopicChange(raw)) return null;
+
+  const extracted = { type: normalizeType(previousTriage?.type) };
+  const yesNo = parseYesNo(raw);
+
+  if (expected === "location") {
+    if (yesNo !== null) return { relevant: true, extracted };
+    extracted.location = raw;
+  } else if (expected === "ongoing") {
+    if (yesNo !== null) extracted.ongoing = yesNo;
+    else extracted.details = raw;
+  } else if (expected === "risk_injuries") {
+    if (yesNo === false) {
+      extracted.people_at_risk = false;
+      extracted.injuries = false;
+    } else if (yesNo === true) {
+      extracted.people_at_risk = true;
+    } else {
+      extracted.details = raw;
+    }
+  } else if (expected === "weapon_visible") {
+    if (yesNo !== null) extracted.weapon_visible = yesNo;
+    else extracted.details = raw;
+  } else if (expected === "person_vehicle_description") {
+    extracted.person_vehicle_description = raw;
+  } else if (expected === "specific_risk") {
+    extracted.specific_risk = raw;
+  } else if (expected === "details") {
+    extracted.details = raw;
+  }
+
+  return { relevant: true, extracted };
+}
+
 function mergeTriage(previous = {}, extracted = {}) {
   const next = { ...previous };
   const fields = ["location", "details", "person_vehicle_description", "direction", "specific_risk"];
@@ -96,6 +193,10 @@ function nextEmergencyQuestion(triage = {}, questionCount = 0) {
 }
 
 async function analyzeEmergencyMessage({ message, history = [], previousTriage = {}, ticket = null }) {
+  const deterministic = deterministicFollowup({ message, history, previousTriage });
+  if (deterministic) return deterministic;
+
+  const inferredType = inferEmergencyTypeFromText(message);
   const prompt = `
 Voc\u00ea faz TRIAGEM DE EMERG\u00caNCIA para a AARS. Seu papel aqui \u00e9 somente extrair dados operacionais e decidir se a mensagem atual complementa a emerg\u00eancia ativa.
 
@@ -152,7 +253,7 @@ Retorne SOMENTE JSON v\u00e1lido:
     return {
       relevant: data.relevant_to_emergency !== false,
       extracted: {
-        type: normalizeType(data.type),
+        type: normalizeType(inferredType || data.type),
         location: cleanText(data.location),
         ongoing: boolOrNull(data.ongoing),
         people_at_risk: boolOrNull(data.people_at_risk),
@@ -166,7 +267,7 @@ Retorne SOMENTE JSON v\u00e1lido:
     };
   } catch (error) {
     console.warn("Falha na triagem estruturada de emergencia:", { message: error.message });
-    return { relevant: true, extracted: { type: normalizeType(previousTriage?.type) } };
+    return { relevant: true, extracted: { type: normalizeType(inferredType || previousTriage?.type) } };
   }
 }
 
