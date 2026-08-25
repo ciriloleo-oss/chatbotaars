@@ -32,7 +32,14 @@ const {
   saveEmergencyRecipient,
   dispatchEmergencyMessage,
   sendEmergencyTest,
+  updateEmergencyTriage,
 } = require("./emergencyService");
+const {
+  analyzeEmergencyMessage,
+  mergeTriage,
+  nextEmergencyQuestion,
+  buildEmergencyResidentReply,
+} = require("./emergencyTriageService");
 const { planTicketRouting } = require("./ticketRouting");
 
 const app = express();
@@ -610,6 +617,27 @@ app.post("/api/chat", async (req, res) => {
     const contextHistory = clientHistory.length ? clientHistory : activeHistory;
     let classification = await classifyInteraction(message, contextHistory, resident);
 
+    // Se existe uma emergencia ativa ainda em triagem, uma resposta curta pode parecer
+    // nao emergencial ao classificador geral. A triagem especializada decide se ela
+    // complementa a ocorrencia antes do roteamento de OS.
+    let emergencyTriageAnalysis = null;
+    const activeEmergencyInTriage = Boolean(
+      activeTicket?.emergency && !activeTicket?.emergency_triage_complete
+    );
+    if (activeEmergencyInTriage) {
+      emergencyTriageAnalysis = await analyzeEmergencyMessage({
+        message,
+        history: contextHistory,
+        previousTriage: activeTicket.emergency_triage || {},
+        ticket: activeTicket,
+      });
+      if (emergencyTriageAnalysis.relevant) {
+        classification.emergency = true;
+        classification.intent = "ATENDIMENTO";
+        classification.priority = "CRITICA";
+      }
+    }
+
     // A trava documental agora vale também quando já existe uma OS na sessão.
     // Assim, uma pergunta sobre RI/Estatuto não contamina a solicitação operacional ativa.
     classification = enforceNewConversationIntent(classification, message);
@@ -670,13 +698,15 @@ app.post("/api/chat", async (req, res) => {
     // continua sendo uma OS própria com protocolo, categoria, prioridade e status independentes.
     await ensureConversationId(sessionState, tickets);
 
-    const routing = await planTicketRouting({
-      message,
-      classification,
-      tickets,
-      activeTicketId: sessionState.activeTicketId,
-      history: contextHistory,
-    });
+    const routing = activeEmergencyInTriage && emergencyTriageAnalysis?.relevant && activeTicket
+      ? { action: "CONTINUE", targetTicketId: activeTicket.id, reason: "complemento da triagem de emergencia ativa" }
+      : await planTicketRouting({
+          message,
+          classification,
+          tickets,
+          activeTicketId: sessionState.activeTicketId,
+          history: contextHistory,
+        });
 
     let ticket = null;
     let residentMessageRow = null;
@@ -715,35 +745,71 @@ app.post("/api/chat", async (req, res) => {
     sessionState.activeTicketId = ticket.id;
     activeTicket = ticket;
 
-    // Emergência não espera o fim da conversa: dispara assim que a mensagem é registrada.
-    // Falhas no WhatsApp não bloqueiam a criação/continuidade da OS.
-    if (messageWasEmergency && residentMessageRow?.id) {
+    const emergencyTurn = Boolean(messageWasEmergency || (activeEmergencyInTriage && emergencyTriageAnalysis?.relevant));
+    let triageQuestion = null;
+    let triageData = ticket.emergency_triage || {};
+    let isFirstEmergencyAlert = Boolean(messageWasEmergency && (isNewTopic || !hadExistingTickets || !activeEmergencyInTriage));
+
+    if (emergencyTurn && residentMessageRow?.id) {
       try {
         await dispatchEmergencyMessage({
           ticketId: ticket.id,
           ticketMessageId: residentMessageRow.id,
           message,
-          dispatchType: isNewTopic || !hadExistingTickets ? "ALERT" : "UPDATE",
+          dispatchType: isFirstEmergencyAlert ? "ALERT" : "UPDATE",
         });
       } catch (error) {
-        // A OS nunca deixa de ser criada por falha do provedor de WhatsApp.
-        console.error("Falha no despacho automático de emergência:", {
+        console.error("Falha no despacho automatico de emergencia:", {
           protocol: ticket.protocol,
           message: error.message,
         });
       }
+
+      try {
+        const analysis = emergencyTriageAnalysis || await analyzeEmergencyMessage({
+          message,
+          history: contextHistory,
+          previousTriage: ticket.emergency_triage || {},
+          ticket,
+        });
+        triageData = mergeTriage(ticket.emergency_triage || {}, analysis.extracted || {});
+        const currentQuestionCount = Number(ticket.emergency_triage_question_count || 0);
+        triageQuestion = nextEmergencyQuestion(triageData, currentQuestionCount);
+        const complete = !triageQuestion || currentQuestionCount >= 3;
+        ticket = await updateEmergencyTriage(ticket.id, {
+          triage: triageData,
+          questionAsked: Boolean(triageQuestion),
+          complete,
+        });
+        const index = tickets.findIndex((item) => item.id === ticket.id);
+        if (index >= 0) tickets[index] = ticket;
+      } catch (triageError) {
+        console.error("Falha ao atualizar triagem da emergencia:", {
+          protocol: ticket.protocol,
+          message: triageError.message,
+        });
+      }
     }
 
-    const operationalReply = buildRoutedOperationalReply(
-      classification,
-      ticket,
-      isNewTopic,
-      hadExistingTickets
-    );
-
-    let reply = operationalReply;
-    if (classification.intent === "CONSULTA_ATENDIMENTO") {
-      reply = combineHybrid(knowledge?.answer, operationalReply);
+    let reply;
+    if (emergencyTurn) {
+      reply = buildEmergencyResidentReply({
+        protocol: ticket.protocol,
+        firstAlert: isFirstEmergencyAlert,
+        triage: triageData,
+        question: triageQuestion,
+      });
+    } else {
+      const operationalReply = buildRoutedOperationalReply(
+        classification,
+        ticket,
+        isNewTopic,
+        hadExistingTickets
+      );
+      reply = operationalReply;
+      if (classification.intent === "CONSULTA_ATENDIMENTO") {
+        reply = combineHybrid(knowledge?.answer, operationalReply);
+      }
     }
 
     await appendTicketMessage(ticket.id, "assistant", reply);

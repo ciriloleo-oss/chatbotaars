@@ -259,6 +259,40 @@ async function dispatchEmergencyMessage({ ticketId, ticketMessageId, message, di
   return { success: true, text, dispatches: results };
 }
 
+
+async function updateEmergencyTriage(ticketId, { triage = {}, questionAsked = false, complete = false } = {}) {
+  const payload = {
+    emergency_type: triage.type || null,
+    emergency_location: triage.location || null,
+    emergency_ongoing: triage.ongoing === true ? true : triage.ongoing === false ? false : null,
+    emergency_people_at_risk: triage.people_at_risk === true ? true : triage.people_at_risk === false ? false : null,
+    emergency_injuries: triage.injuries === true ? true : triage.injuries === false ? false : null,
+    emergency_triage: triage || {},
+    emergency_triage_complete: Boolean(complete),
+    emergency_triage_updated_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  if (questionAsked) {
+    const { data: current, error: currentError } = await supabase
+      .from("tickets")
+      .select("emergency_triage_question_count")
+      .eq("id", ticketId)
+      .maybeSingle();
+    if (currentError) throw currentError;
+    payload.emergency_triage_question_count = Math.min(Number(current?.emergency_triage_question_count || 0) + 1, 3);
+  }
+
+  const { data, error } = await supabase
+    .from("tickets")
+    .update(payload)
+    .eq("id", ticketId)
+    .select("*")
+    .single();
+  if (error) throw error;
+  return data;
+}
+
 async function sendEmergencyTest(recipientId) {
   const { data: recipient, error } = await supabase
     .from("emergency_recipients")
@@ -324,4 +358,5 @@ module.exports = {
   dispatchEmergencyMessage,
   sendEmergencyTest,
   getEmergencyDispatchesForTicket,
+  updateEmergencyTriage,
 };
